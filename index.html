@@ -1,0 +1,344 @@
+<!DOCTYPE html>
+<html style="margin:0; overflow:hidden;">
+<head>
+	<title>Maze Network Pro</title>
+	<style>
+		html, body { height: 100%; margin: 0; }
+		body { background: #1a1a1a; color: #eee; font-family: monospace; overflow: hidden; }
+
+		#app { display: flex; height: 100vh; width: 100vw; box-sizing: border-box; gap: 12px; padding: 12px; overflow: hidden; }
+		/* Default: horizontal (tools | map | panel). Switches to vertical on
+		   narrow / portrait windows via the media query below. */
+		#app { flex-direction: row; }
+		#map-area { flex: 1; min-width: 0; }
+		#panel { flex-direction: column; }
+
+		#tools {
+			background: #111827; border: 1px solid #374151; border-radius: 8px; padding: 10px;
+			display: flex; flex-direction: column; gap: 10px; overflow: auto; flex: none;
+			max-width: 240px;
+		}
+		.toolbar { display: flex; flex-direction: column; align-items: center; gap: 6px; }
+		.toolbar .label {
+			font-size: 9px; color: #9ca3af; text-transform: uppercase; letter-spacing: .8px;
+			margin-top: 6px; align-self: flex-start; padding-left: 2px;
+		}
+		.view-switch { display: flex; flex-direction: row; flex-wrap: wrap; align-items: center; gap: 8px; flex-basis: 100%; }
+		.view-switch .label { margin: 0; }
+		.eye-ico { width: 18px; height: 18px; stroke: currentColor; fill: none; stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; }
+		.tool-row { display: flex; flex-wrap: wrap; gap: 6px; }
+		.view-switch .tool-btn {
+			width: auto; height: auto; min-width: 40px; padding: 0 12px; white-space: nowrap;
+		}
+		.tool-btn {
+			width: 40px; height: 40px; border-radius: 10px; border: 2px solid transparent;
+			background: #1f2937; color: #d1d5db; cursor: pointer; display: grid; place-items: center;
+			transition: .15s;
+		}
+		.tool-btn:hover { background: #374151; }
+		.tool-btn.active { border-color: #818cf8; box-shadow: 0 0 0 2px rgba(129,140,248,.3); }
+		.tool-btn svg { width: 20px; height: 20px; stroke: currentColor; fill: none; stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; }
+		.swatch-row { display: flex; gap: 6px; flex-wrap: wrap; justify-content: center; padding: 0 4px; }
+		.swatch { width: 24px; height: 24px; border-radius: 50%; cursor: pointer; border: 2px solid transparent; transition: .15s; }
+		.swatch:hover { transform: scale(1.15); }
+		.swatch.active { border-color: #fff; box-shadow: 0 0 6px rgba(255,255,255,.5); transform: scale(1.15); }
+		#advanced {
+			display: flex; flex-direction: column; gap: 8px; border-top: 1px solid #374151;
+			padding-top: 10px; font-size: 11px; color: #cbd5e1;
+		}
+		#advanced select, #advanced input[type=range] { font-family: monospace; font-size: 11px; }
+		#advanced #clearBtn { font-family: monospace; font-size: 11px; cursor: pointer; background: #1f2937; color: #eee; border: 1px solid #374151; border-radius: 4px; padding: 4px; }
+		.obstacle-types { display: flex; flex-direction: column; gap: 4px; margin: 2px 0 4px; }
+		.otype-btn {
+			width: 100%; padding: 6px 8px; border-radius: 8px; border: 2px solid transparent;
+			background: #1f2937; color: #d1d5db; cursor: pointer; font-family: monospace; font-size: 11px; text-align: left;
+			transition: .15s;
+		}
+		.otype-btn:hover { background: #374151; }
+		.otype-btn.active { border-color: #818cf8; box-shadow: 0 0 0 2px rgba(129,140,248,.3); color: #fff; background: #312e81; }
+		.strat-row { display: flex; flex-direction: column; gap: 4px; margin: 2px 0 4px; }
+		.strat-btn {
+			width: 100%; padding: 6px 8px; border-radius: 8px; border: 2px solid transparent;
+			background: #1f2937; color: #d1d5db; cursor: pointer; font-family: monospace; font-size: 11px; text-align: left;
+			transition: .15s;
+		}
+		.strat-btn:hover { background: #374151; }
+		.strat-btn.active { border-color: #818cf8; box-shadow: 0 0 0 2px rgba(129,140,248,.3); color: #fff; background: #312e81; }
+		#map-area {
+			background: #222; border: 1px solid #555; border-radius: 8px; padding: 12px;
+			display: flex; flex-wrap: wrap; align-items: center; justify-content: center; overflow: hidden; position: relative;
+		}
+		.prop-panel { position: absolute; top: 12px; right: 12px; width: 200px; background: rgba(17,24,39,.96); border: 1px solid #374151; border-radius: 8px; padding: 10px; font-size: 11px; color: #cbd5e1; box-shadow: 0 4px 18px rgba(0,0,0,.45); z-index: 5; }
+		.prop-panel h4 { margin: 0 0 6px; font-size: 11px; text-transform: uppercase; letter-spacing: .8px; color: #9ca3af; }
+		.prop-row { display: flex; justify-content: space-between; gap: 8px; padding: 2px 0; }
+		.prop-sub { margin: 8px 0 3px; padding-top: 6px; border-top: 1px solid #374151; font-size: 10px; text-transform: uppercase; letter-spacing: .8px; color: #6b7280; }
+		.prop-panel label.ctrl { display: flex; align-items: center; gap: 6px; font-size: 11px; color: #9ca3af; margin-top: 6px; cursor: default; }
+		.prop-panel label.ctrl .ctrl-val { color: #e5e7eb; font-variant-numeric: tabular-nums; white-space: nowrap; }
+		.prop-panel input[type=range] { flex: 1; min-width: 0; height: 4px; }
+		.prop-panel button { font-family: monospace; font-size: 11px; cursor: pointer; background: #1f2937; color: #eee; border: 1px solid #374151; border-radius: 4px; padding: 4px; width: 100%; margin-top: 8px; }
+		.prop-panel button:hover { background: #374151; }
+		.prop-close { position: absolute; top: 6px; right: 8px; cursor: pointer; color: #9ca3af; font-size: 13px; }
+		.prop-close:hover { color: #fff; }
+		.status {
+			position: absolute; bottom: 0; left: 0; right: 0; height: 26px;
+			background: rgba(17,24,39,.85); backdrop-filter: blur(4px);
+			display: flex; align-items: center; padding: 0 14px; gap: 16px;
+			font-size: 11px; color: #9ca3af; pointer-events: none; border-radius: 0 0 8px 8px;
+		}
+
+		/* The whole panel (list + log) takes 20% of the main axis:
+		   20% width in horizontal, 20% height in vertical. */
+		#panel { display: flex; gap: 12px; flex: 0 0 20%; min-width: 0; min-height: 0; overflow: hidden; }
+
+		/* Vertical layout for narrow / portrait windows. */
+		@media (max-width: 960px), (max-aspect-ratio: 1/1) {
+			#app { flex-direction: column; }
+			#tools { max-height: 38vh; width: auto; }
+			#map-area { flex: 1; min-height: 0; min-width: auto; }
+			#panel { flex: 0 0 22%; flex-direction: row; }
+		}
+
+		.card {
+			display: flex; flex-direction: column; background: #111; border: 1px solid #444;
+			border-radius: 8px; overflow: hidden; min-width: 0; min-height: 0;
+		}
+		/* Inside the panel, Path List and System Log split 50 / 50. */
+		#path-card { flex: 1 1 0; }
+		#log-card { flex: 1 1 0; }
+		.card-head {
+			padding: 10px; background: #222; border-bottom: 1px solid #444; font-weight: bold;
+			display: flex; justify-content: space-between; align-items: center; gap: 8px; flex: none; cursor: pointer; user-select: none;
+		}
+		.card.collapsed > *:not(.card-head) { display: none; }
+		.card-head .fold { display: inline-block; width: 12px; color: #9ca3af; }
+		.card-head .ht { flex: 1; }
+		#inv-list { flex: 1; overflow-y: auto; padding: 10px; font-size: 12px; color: #ccc; }
+		.inv-row { display: flex; align-items: center; gap: 8px; padding: 2px 0; }
+		.build-hint { font-size: 9px; color: #6b7280; line-height: 1.3; padding: 0 2px; }
+		.inv-item { cursor: pointer; border-radius: 4px; padding: 2px 4px; }
+		.inv-item:hover { background: #1f2937; }
+		.inv-item.inv-sel { background: #312e81; color: #fff; box-shadow: 0 0 0 1px #818cf8 inset; }
+		.inv-ico { width: 18px; height: 18px; flex: none; stroke: currentColor; fill: none; stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; }
+		.inv-sub { color: #9ca3af; font-size: 11px; margin-top: 4px; }
+		.item-list { display: flex; flex-direction: column; gap: 4px; }
+		.gm-item { display: flex; align-items: center; gap: 8px; cursor: pointer; border-radius: 4px; padding: 4px 6px; font-size: 12px; color: #d1d5db; }
+		.gm-item:hover { background: #1f2937; }
+		.gm-item.inv-sel { background: #312e81; color: #fff; box-shadow: 0 0 0 1px #818cf8 inset; }
+		#log { flex: 1; overflow-y: auto; padding: 10px; font-size: 12px; color: #aaa; }
+		#path-list { flex: 1; overflow-y: auto; padding: 10px; font-size: 12px; color: #ccc; }
+
+		.color-group { display: flex; gap: 8px; align-items: center; }
+		.ctrl { display: flex; align-items: center; gap: 8px; font-size: 12px; cursor: pointer; }
+		canvas { background: #ddd; border: 3px solid #444; cursor: crosshair; image-rendering: pixelated; display: block; box-sizing: border-box; width: 100%; height: 100%; object-fit: contain; touch-action: none; }
+		.path-entry { display: flex; align-items: center; gap: 8px; padding: 2px 0; }
+		.path-swatch { width: 12px; height: 12px; border-radius: 50%; border: 1px solid #fff; flex: none; }
+		.path-empty { color: #777; font-style: italic; }
+		.log-entry { border-bottom: 1px solid #222; padding: 2px 0; }
+		.log-entry.sys { color: #0f0; }
+		.log-entry.err { color: #f55; }
+		</style>
+</head>
+<body>
+	<div id="app">
+		<div id="tools">
+			<div class="toolbar">
+				<div class="label">GODMODE (unlimited)</div>
+				<div id="godmodeList" class="item-list"></div>
+				<div class="label">BUILD</div>
+				<div class="tool-row">
+					<button class="tool-btn" id="btnSelect" title="Select (S) — pick item in Inventory, then place; double-click to pick up">
+						<svg viewBox="0 0 24 24"><path d="M5 3l6 16 2.5-6.5L20 10z"/></svg></button>
+				</div>
+				<div class="strat-row">
+					<button type="button" class="strat-btn active" data-strat="a" title="Biggest pieces first (fewest junctions)">a) Biggest</button>
+					<button type="button" class="strat-btn" data-strat="b" title="Smallest pieces first (most junctions)">b) Smallest</button>
+					<button type="button" class="strat-btn" data-strat="c" title="Manual: commit instantly; pick a length in Inventory">c) Manual</button>
+				</div>
+				<div class="label">Colors</div>
+				<div class="swatch-row" id="palette"></div>
+				<div class="label">Maze Type</div>
+				<div class="tool-row">
+					<button class="tool-btn active" id="btnTypeConnected" title="New Connected (DFS) Maze">
+						<svg viewBox="0 0 24 24"><circle cx="6" cy="6" r="2.2"/><circle cx="18" cy="18" r="2.2"/><circle cx="6" cy="18" r="2.2"/><path d="M6 8.2V15.8M8 7L16 16.5M8 17L16 7.5"/></svg></button>
+					<button class="tool-btn" id="btnTypeRandom" title="New Random Maze">
+						<svg viewBox="0 0 24 24"><circle cx="6" cy="6" r="1.6"/><circle cx="17" cy="7" r="1.6"/><circle cx="9" cy="14" r="1.6"/><circle cx="18" cy="18" r="1.6"/><circle cx="5" cy="18" r="1.6"/></svg></button>
+					<button class="tool-btn" id="btnTypeDivision" title="New Recursive Division Maze">
+						<svg viewBox="0 0 24 24"><rect x="3" y="3" width="18" height="18" rx="1"/><path d="M12 3v9M12 12h9M3 15h9M12 15v6"/></svg></button>
+				</div>
+				<div class="label">Scenes</div>
+				<div class="tool-row" id="sceneRow" style="flex-wrap: wrap;">
+				<button type="button" class="otype-btn" data-scene="electric-combo" title="Combined circuit: 2 batteries in series → 2 switches in series → 1 lamp → 2 parallel lamps, each with its own switch. Toggle switches; watch series voltage (~2·Vbat) emerge and parallel branches act independently.">Electricity</button>
+				<button type="button" class="otype-btn" data-scene="tunnel-air" title="20×1 sealed air tunnel: Air Source (3,15) → Air Sink (17,15). Watch the PV=nRT pressure gradient in the Air/Pressure views.">Air Tunnel</button>
+				</div>
+			</div>
+			<div id="advanced">
+				<label class="ctrl"><input type="checkbox" id="autoConnect" checked> Auto Connect</label>
+				<label class="ctrl"><input type="checkbox" id="autoSpawnNodes" checked> Auto Spawn Junctions</label>
+				<label class="ctrl"><input type="checkbox" id="autoSpawnTurns"> Spawn Turn Nodes</label>
+			<label class="ctrl"><input type="checkbox" id="cooling"> Thermal sink (cool to ambient)</label>
+			<label class="ctrl" title="Field is the default and is the only engine under active development. Circuit is kept (and tested) for the strict closed-loop nodal model; it will not get new features.">Engine:
+				<select id="engineSel">
+					<option value="field">Field (diffusion)</option>
+					<option value="circuit">Circuit (nodal, obsolete)</option>
+				</select>
+			</label>
+			<label class="ctrl">Metal R:
+				<input type="range" id="metalR" min="1" max="200" step="1" value="20">
+				<span id="metalRVal">20</span> Ω
+			</label>
+			<label class="ctrl">Battery R:
+				<input type="range" id="batR" min="0.1" max="5" step="0.1" value="0.5">
+				<span id="batRVal">0.5</span> Ω
+			</label>
+			<label class="ctrl">Sim speed:
+				<input type="range" id="timeScale" min="0.5" max="40" step="0.5" value="10">
+				<span id="timeScaleVal">10</span>×
+			</label>
+			<button id="pauseBtn" class="ctrl" style="font-family: monospace; font-size: 11px; cursor: pointer; background: #1f2937; color: #eee; border: 1px solid #374151; border-radius: 4px; padding: 4px;">⏸ Pause</button>
+				<label class="ctrl"><input type="checkbox" id="preserveWiring"> Preserve Wiring</label>
+				<label class="ctrl">Path/Cell limit:
+					<input type="range" id="pathLimit" min="0" max="7" step="1" value="0">
+					<span id="pathLimitVal">∞</span>
+				</label>
+				<label class="ctrl"><input type="checkbox" id="showCellX"> Show shared-cell X</label>
+				<label class="ctrl"><input type="checkbox" id="stableColorLanes"> Stable color lanes</label>
+				<button id="clearBtn">Clear All Nodes</button>
+			</div>
+		</div>
+		<div id="map-area">
+			<div class="view-switch">
+				<div class="label" title="View"><svg viewBox="0 0 24 24" class="eye-ico"><path d="M1 12s4-7 11-7 11 7 11 7-4 7-11 7S1 12 1 12z"/><circle cx="12" cy="12" r="3"/></svg></div>
+				<div class="tool-row" id="viewRow">
+				<button type="button" class="tool-btn active" id="btnViewNet" title="Show each net in its identity color">Net</button>
+				<button type="button" class="tool-btn" id="btnResetView" title="Reset view to 1x at (0,0)">1x</button>
+				<button type="button" class="tool-btn" id="btnViewElectric" title="Show wires grey until powered by a battery (then r/b)">Electric</button>
+				<button type="button" class="tool-btn" id="btnViewLight" title="Darkness lit by lamps and wires; light falls off with distance (each step loses ~30%, a 90° turn halves what remains), lamp colours mix additively, walls block">Light</button>
+				<button type="button" class="tool-btn" id="btnViewVoltage" title="Voltage heatmap (blue 0V → red Vbat) with per-node V, per-lamp ΔV and per-node R→+/R→−">Voltages</button>
+				<button type="button" class="tool-btn" id="btnViewHeat" title="Temperature from Joule (I²R) heating, diffusing through all cells. Blue = cool, red = hot; a legend shows the auto-scaled peak. Higher lamp resistance ⇒ more heat.">Heat</button>
+				<button type="button" class="tool-btn" id="btnViewPressure" title="Pressure (PV=nRT) view: pressure map + particles + flow-direction arrows">Pressure</button>
+			</div>
+			</div><br>
+			<canvas id="ctx"></canvas>
+			<div id="propPanel" class="prop-panel" style="display:none;"></div>
+			<template id="prop-tpl-lamp">
+				<div class="prop-close" data-close>&#x2715;</div>
+				<h4>Lamp</h4>
+				<div class="prop-sub">Inputs</div>
+				<label class="ctrl"><span>Light color</span><span class="ctrl-val"></span><input type="color" data-input="color" value=""></label>
+				<div data-show="limited"><label class="ctrl"><span>Resistance (Ω)</span><span class="ctrl-val" data-bind="rHead"></span><input type="range" data-input="R" min="0.1" max="10" step="0.1" value=""></label></div>
+				<div class="prop-sub">Efficiency</div>
+				<label class="ctrl"><span>Efficacy (lm/W)</span><span class="ctrl-val" data-bind="effHead"></span><input type="range" data-input="efficiency" min="0" max="300" step="5" value=""></label>
+				<div class="prop-sub">Outputs</div>
+				<div class="prop-row"><span>ΔV (drop)</span><span data-bind="dV"></span></div>
+				<div class="prop-row"><span>Lit</span><span data-bind="lit"></span></div>
+				<div class="prop-row"><span>Light</span><span data-bind="light"></span></div>
+				<div class="prop-row"><span>Power</span><span data-bind="power"></span></div>
+				<div class="prop-row"><span>Wired</span><span data-bind="wired"></span></div>
+				<div class="prop-row"><span>Network</span><span data-bind="network"></span></div>
+				<button data-return>Return to inventory</button>
+			</template>
+			<template id="prop-tpl-wire">
+				<div class="prop-close" data-close>&#x2715;</div>
+				<h4>Wire</h4>
+				<div class="prop-row"><span>Cells</span><span data-bind="cells"></span></div>
+				<div class="prop-row"><span>Color</span><span data-bind="color"></span></div>
+				<div class="prop-row"><span>Powered</span><span data-bind="powered"></span></div>
+				<div class="prop-row"><span>Voltage</span><span data-bind="voltage"></span></div>
+				<div class="prop-row"><span>R→+</span><span data-bind="rPos"></span></div>
+				<div class="prop-row"><span>R→−</span><span data-bind="rNeg"></span></div>
+				<button data-return>Return to inventory</button>
+			</template>
+			<template id="prop-tpl-battery">
+				<div class="prop-close" data-close>&#x2715;</div>
+				<h4>Battery</h4>
+				<div class="prop-row"><span>Pos</span><span data-bind="pos"></span></div>
+				<div class="prop-row"><span>Charge</span><span data-bind="charge"></span></div>
+				<div class="prop-row"><span>Terminals</span><span data-bind="terminals"></span></div>
+				<button data-return>Return to inventory</button>
+			</template>
+			<template id="prop-tpl-switch">
+				<div class="prop-close" data-close>&#x2715;</div>
+				<h4>Switch</h4>
+				<div class="prop-row"><span>State</span><span data-bind="state"></span></div>
+				<label class="ctrl"><span>Closed</span><span class="ctrl-val" data-bind="ctrlval"></span><input type="checkbox" data-input="switch"></label>
+				<div class="prop-row"><span>Wired</span><span data-bind="wired"></span></div>
+				<div class="prop-row"><span>Powered</span><span data-bind="powered"></span></div>
+				<div class="prop-row"><span>Voltage</span><span data-bind="voltage"></span></div>
+				<div class="prop-row"><span>R→+</span><span data-bind="rPos"></span></div>
+				<div class="prop-row"><span>R→−</span><span data-bind="rNeg"></span></div>
+				<button data-return>Return to inventory</button>
+			</template>
+			<template id="prop-tpl-heatsink">
+				<div class="prop-close" data-close>&#x2715;</div>
+				<h4>Heat Sink</h4>
+				<div class="prop-row"><span>Pos</span><span data-bind="pos"></span></div>
+				<div class="prop-row"><span>Cooling</span><span data-bind="cooling"></span></div>
+				<div class="prop-row"><span>Network</span><span data-bind="network"></span></div>
+				<button data-return>Return to inventory</button>
+			</template>
+			<template id="prop-tpl-airsrc">
+				<div class="prop-close" data-close>&#x2715;</div>
+				<h4>Air Source</h4>
+				<div class="prop-row"><span>Pos</span><span data-bind="pos"></span></div>
+				<label class="ctrl"><span>Temp (K)</span><span class="ctrl-val" data-bind="srcTHead"></span><input type="range" data-input="srcT" min="0" max="400" step="1" value=""></label>
+				<label class="ctrl"><span>Rate (kg/s)</span><span class="ctrl-val" data-bind="rateHead"></span><input type="range" data-input="rate" min="0.001" max="2" step="0.001" value=""></label>
+				<button data-return>Return to inventory</button>
+			</template>
+		<template id="prop-tpl-airsink">
+			<div class="prop-close" data-close>&#x2715;</div>
+			<h4>Air Sink</h4>
+			<div class="prop-row"><span>Pos</span><span data-bind="pos"></span></div>
+			<label class="ctrl"><span>Rate (kg/s)</span><span class="ctrl-val" data-bind="rateHead"></span><input type="range" data-input="rate" min="0.001" max="2" step="0.001" value=""></label>
+			<button data-return>Return to inventory</button>
+		</template>
+		<template id="prop-tpl-pipe">
+			<div class="prop-close" data-close>&#x2715;</div>
+			<h4>Pipe <span data-bind="kind">Valve</span></h4>
+			<div class="prop-row"><span>Cell</span><span data-bind="pos"></span></div>
+			<label class="ctrl"><span>Openness</span><span class="ctrl-val" data-bind="openHead"></span><input type="range" data-input="open" min="0" max="1" step="0.01" value=""></label>
+			<div data-show="paired" class="prop-row"><span>Paired with</span><span data-bind="partner"></span></div>
+			<button data-return>Return to inventory</button>
+		</template>
+		<template id="prop-tpl-node">
+				<div class="prop-close" data-close>&#x2715;</div>
+				<h4>Node</h4>
+				<div class="prop-row"><span>Pos</span><span data-bind="pos"></span></div>
+				<div class="prop-row"><span>Color</span><span data-bind="color"></span></div>
+				<div class="prop-row"><span>Voltage</span><span data-bind="voltage"></span></div>
+				<div class="prop-row"><span>R→+</span><span data-bind="rPos"></span></div>
+				<div class="prop-row"><span>R→−</span><span data-bind="rNeg"></span></div>
+			</template>
+			<div class="status" id="statusBar">Tool: Place Node | Cell: — | Type: —</div>
+		</div>
+		<div id="panel">
+			<div class="card" id="path-card">
+				<div class="card-head" data-target="path-card">
+					<span class="fold">&#x25be;</span><span class="ht">Path List</span>
+					<button id="copyPathsBtn" title="Copy nodes &amp; links" style="cursor: pointer; font-size: 13px; line-height: 1; padding: 2px 6px; background: #333; color: #eee; border: 1px solid #555; border-radius: 4px;">&#x2219;&#x2219;</button>
+				</div>
+				<div id="path-list"></div>
+			</div>
+			<div class="card" id="inv-card">
+				<div class="card-head" data-target="inv-card">
+					<span class="fold">&#x25be;</span><span class="ht">Inventory</span>
+				</div>
+				<div id="inv-list"></div>
+			</div>
+			<div class="card" id="log-card">
+				<div class="card-head" data-target="log-card">
+					<span class="fold">&#x25be;</span><span class="ht">System Log</span>
+				</div>
+				<div id="log"></div>
+			</div>
+		</div>
+	</div>
+
+	<script src="js/state.js"></script>
+	<script src="js/maze.js"></script>
+	<script src="js/network.js"></script>
+	<script src="js/render.js"></script>
+	<script src="js/electric.js"></script>
+	<script src="js/air.js"></script>
+	<script src="js/ui.js"></script>
+</body>
+</html>
