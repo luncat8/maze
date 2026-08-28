@@ -169,6 +169,7 @@
 				<div class="tool-row" id="sceneRow" style="flex-wrap: wrap;">
 				<button type="button" class="otype-btn" data-scene="electric-combo" title="Combined circuit: 2 batteries in series → 2 switches in series → 1 lamp → 2 parallel lamps, each with its own switch. Toggle switches; watch series voltage (~2·Vbat) emerge and parallel branches act independently.">Electricity</button>
 				<button type="button" class="otype-btn" data-scene="tunnel-air" title="20×1 sealed air tunnel: Air Source (3,15) → Air Sink (17,15). Watch the PV=nRT pressure gradient in the Air/Pressure views.">Air Tunnel</button>
+				<button type="button" class="otype-btn" data-scene="piston-pump" title="Sealed chamber with Air Pump and 2×1 Piston: Pump builds pressure that pushes the piston against friction.">Piston &amp; Pump</button>
 				</div>
 			</div>
 			<div id="advanced">
@@ -297,6 +298,41 @@
 			<div class="prop-row"><span>Cell</span><span data-bind="pos"></span></div>
 			<label class="ctrl"><span>Openness</span><span class="ctrl-val" data-bind="openHead"></span><input type="range" data-input="open" min="0" max="1" step="0.01" value=""></label>
 			<div data-show="paired" class="prop-row"><span>Paired with</span><span data-bind="partner"></span></div>
+			<button data-return>Return to inventory</button>
+		</template>
+		<template id="prop-tpl-piston">
+			<div class="prop-close" data-close>&#x2715;</div>
+			<h4>Piston (2×1)</h4>
+			<div class="prop-sub">Configuration</div>
+			<div class="prop-row"><span>Cells</span><span data-bind="cells"></span></div>
+			<div class="prop-row"><span>Orientation</span><span data-bind="axis"></span></div>
+			<div class="prop-sub">Friction Dynamics</div>
+			<label class="ctrl"><span>Friction (N)</span><span class="ctrl-val" data-bind="fricHead"></span><input type="range" data-input="friction" min="0" max="500" step="5" value="50"></label>
+			<div class="prop-sub">Live Telemetry</div>
+			<div class="prop-row"><span>Velocity</span><span data-bind="speed"></span></div>
+			<div class="prop-row"><span>ΔP (Drive)</span><span data-bind="deltaP"></span></div>
+			<div class="prop-row"><span>F_press</span><span data-bind="fPress"></span></div>
+			<div class="prop-row"><span>F_fric</span><span data-bind="fFric"></span></div>
+			<div class="prop-row"><span>Status</span><span data-bind="status"></span></div>
+			<button data-return>Return to inventory</button>
+		</template>
+		<template id="prop-tpl-pump">
+			<div class="prop-close" data-close>&#x2715;</div>
+			<h4>Air Pump</h4>
+			<div class="prop-sub">Configuration</div>
+			<div class="prop-row"><span>Cell</span><span data-bind="pos"></span></div>
+			<label class="ctrl"><span>Direction</span><span class="ctrl-val" data-bind="dirHead"></span><input type="range" data-input="dir" min="0" max="3" step="1" value="1"></label>
+			<div class="prop-sub">Electrical Input</div>
+			<div data-show="limited"><label class="ctrl"><span>Resistance (Ω)</span><span class="ctrl-val" data-bind="rHead"></span><input type="range" data-input="R" min="0.1" max="10" step="0.1" value="10"></label></div>
+			<label class="ctrl"><span>Efficiency (%)</span><span class="ctrl-val" data-bind="effHead"></span><input type="range" data-input="efficiency" min="0" max="100" step="1" value="70"></label>
+			<div class="prop-sub">Live Telemetry</div>
+			<div class="prop-row"><span>ΔV (drop)</span><span data-bind="dV"></span></div>
+			<div class="prop-row"><span>Power (Elec)</span><span data-bind="power"></span></div>
+			<div class="prop-row"><span>Flow Rate</span><span data-bind="flow"></span></div>
+			<div class="prop-row"><span>Head (ΔP)</span><span data-bind="head"></span></div>
+			<div class="prop-row"><span>Net Efficiency</span><span data-bind="actualEff"></span></div>
+			<div class="prop-row"><span>Waste Heat</span><span data-bind="heat"></span></div>
+			<div class="prop-row"><span>Status</span><span data-bind="status"></span></div>
 			<button data-return>Return to inventory</button>
 		</template>
 		<template id="prop-tpl-node">

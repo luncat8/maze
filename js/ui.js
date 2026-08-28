@@ -84,8 +84,11 @@ document.getElementById('clearBtn').onclick = () => {
 	airSinks.length = 0; INV.airsink.count = 1;
 	pipeValves.length = 0; INV.pipevalve.count = 1;
 	pipePortals.length = 0; INV.pipeportal.count = 1;
+	pistons.length = 0; INV.piston.count = 1;
+	pumps.length = 0; INV.pump.count = 1;
 	pendingPortal = null;
 	syncCellOpen();
+	syncPistonOccupancy();
 	seedAir();
 	pendingPlan = null; wireDrag = null; selectedManualWireLen = null; selectedItem = null;
 	buildNetworks();
@@ -123,6 +126,8 @@ document.getElementById('clearBtn').onclick = () => {
 		airSinks.length = 0;
 		pipeValves.length = 0;
 		pipePortals.length = 0;
+		pistons.length = 0;
+		pumps.length = 0;
 		pendingPortal = null;
 		// Scenes are built from the BUILD (limited) inventory, so make sure
 		// there are enough items for the largest scene (2 lamps / 2 switches
@@ -131,12 +136,14 @@ document.getElementById('clearBtn').onclick = () => {
 		INV.battery.count = 1; INV.lamp.count = 2; INV.switch.count = 2; seedWires();
 		INV.airsrc.count = 1; INV.airsink.count = 1;
 		INV.pipevalve.count = 1; INV.pipeportal.count = 1;
+		INV.piston.count = 1; INV.pump.count = 1;
 		pendingPlan = null; wireDrag = null; selectedManualWireLen = null; selectedItem = null;
 		unlimited = false;
 		grid.fill(0);
 		buildNetworks();
 		seedAir();   // scenes start from ambient air (no accumulated pressure)
 		syncCellOpen();
+		syncPistonOccupancy();
 
 		// A closed rectangular loop is required: a single straight wire is an
 		// open circuit and never lights. Battery at (10,15): + (10,15), −
@@ -192,18 +199,62 @@ document.getElementById('clearBtn').onclick = () => {
 			placeAirSource(3, 15);
 			placeAirSink(17, 15);
 			logger('Scene: 20×1 Air tunnel — source(3,15) → sink(17,15). Use the Air/Pressure views to watch the gradient form.', 'sys');
+		} else if (name === 'piston-pump') {
+			// Sealed tunnel with electric pump pushing air to move a 2x1 piston
+			INV.battery.count = 2; INV.switch.count = 2;
+			INV.pump.count = 2; INV.piston.count = 2;
+			grid.fill(1);
+			// Air tunnel along row 15: x = 5..22 (x=4 and x=23 are walls)
+			for (let x = 5; x <= 22; x++) grid[15 * GRID_W + x] = 0;
+			// Corridors for electric circuit:
+			// Battery at (5, 11) - poles are (5, 11) and (5, 12)
+			grid[11 * GRID_W + 5] = 0;
+			grid[12 * GRID_W + 5] = 0;
+			// Positive rail: (5, 11) -> (6, 11) -> (7, 11)[switch] -> (8, 11..14) -> (7, 14) -> (6, 14) -> (6, 15)[pump]
+			grid[11 * GRID_W + 6] = 0;
+			grid[11 * GRID_W + 7] = 0;
+			grid[11 * GRID_W + 8] = 0; grid[12 * GRID_W + 8] = 0; grid[13 * GRID_W + 8] = 0; grid[14 * GRID_W + 8] = 0;
+			grid[14 * GRID_W + 7] = 0; grid[14 * GRID_W + 6] = 0;
+			// Negative rail: (6, 15)[pump] -> (6, 16..17) -> (5..2, 17) -> (2, 16..12) -> (3..5, 12)[battery -]
+			grid[16 * GRID_W + 6] = 0; grid[17 * GRID_W + 6] = 0;
+			for (let x = 2; x <= 6; x++) grid[17 * GRID_W + x] = 0;
+			for (let y = 12; y <= 16; y++) grid[y * GRID_W + 2] = 0;
+			grid[12 * GRID_W + 3] = 0; grid[12 * GRID_W + 4] = 0;
+
+			buildNetworks();
+			seedAir();
+			const rc = (x, y) => y * GRID_W + x;
+			placeBattery(5, 11);
+			placeSwitch(7, 11);
+			sceneAddWire([rc(5, 11), rc(6, 11), rc(7, 11)], '#ef4444');
+			sceneAddWire([rc(7, 11), rc(8, 11), rc(8, 12), rc(8, 13), rc(8, 14), rc(7, 14), rc(6, 14), rc(6, 15)], '#ef4444');
+			sceneAddWire([rc(6, 15), rc(6, 16), rc(6, 17), rc(5, 17), rc(4, 17), rc(3, 17), rc(2, 17), rc(2, 16), rc(2, 15), rc(2, 14), rc(2, 13), rc(2, 12), rc(3, 12), rc(4, 12), rc(5, 12)], '#3b82f6');
+			const sw = switches[switches.length - 1];
+			if (sw) sw.value = true;
+			placePump(6, 15);
+			const pmp = pumps[pumps.length - 1];
+			if (pmp) pmp.dir = 1;
+			placePiston(8, 15);
+			logger('Scene: Piston & Pump — electric pump builds pressure behind the 2×1 piston, sliding it eastward.', 'sys');
 		}
 		// Stray junction nodes left on lamp/switch/battery-pole cells would
 		// overlap their own glyphs; drop them so they draw cleanly.
 		lamps.forEach(l => { if (circles.has(l.idx)) circles.delete(l.idx); });
 		switches.forEach(s => { if (circles.has(s.idx)) circles.delete(s.idx); });
 		manualBatteries.forEach(b => b.poles.forEach(p => { if (circles.has(p)) circles.delete(p); }));
+		pumps.forEach(p => { if (circles.has(p.idx)) circles.delete(p.idx); });
 		setActiveTool('select', { unlimited: false });
-		// Surface the new closed-circuit model: select the lamp (so its ΔV /
-		// Lit state shows) and jump to the Voltages view once the solve runs.
-		const demoLamp = lamps[lamps.length - 1];
-		if (demoLamp) selectedItem = { kind: 'lamp', ref: demoLamp };
-		setColorView(name === 'tunnel-air' ? 'pressure' : 'voltage');
+		if (name === 'piston-pump') {
+			if (pistons.length > 0) selectedItem = { kind: 'piston', ref: pistons[0] };
+			setColorView('pressure');
+		} else if (name === 'tunnel-air') {
+			if (airSources.length > 0) selectedItem = { kind: 'airsrc', ref: airSources[0] };
+			setColorView('pressure');
+		} else {
+			const demoLamp = lamps[lamps.length - 1];
+			if (demoLamp) selectedItem = { kind: 'lamp', ref: demoLamp };
+			setColorView('voltage');
+		}
 		bus.emit('switch:placed'); // recompute() -> simulate() sets lamp dV
 		if (selectedItem) renderProperties(); // refresh panel (lamp dV, or the air source)
 		renderInventory();
@@ -1019,6 +1070,132 @@ function cancelPendingPortal() {
 	logger('Portal cancelled', 'sys');
 }
 
+// Place or select an Air Pump block: sealed wall block pumping air in arrow dir
+function placePump(x, y) {
+	if (x < 0 || x >= GRID_W || y < 0 || y >= GRID_H) return;
+	const idx = y * GRID_W + x;
+	const existing = pumps.find(p => p.idx === idx);
+	if (existing) { selectedItem = { kind: 'pump', ref: existing }; renderProperties(); return; }
+	if (!unlimited && INV.pump.count <= 0) { logger('No air pump left', 'err'); return; }
+	if (!wirePassable(idx)) { logger('Air pump needs a corridor or battery pole', 'err'); return; }
+	if (manualBatteries.some(b => b.poles.includes(idx))) { logger('Air pump cannot sit on a battery pole', 'err'); return; }
+	if (lamps.some(l => l.idx === idx) || switches.some(s => s.idx === idx) || pipeValves.some(v => v.idx === idx) || pipePortals.some(p => p.a === idx || p.b === idx)) {
+		logger('Cell already occupied', 'err'); return;
+	}
+	if (!unlimited) INV.pump.count--;
+	let cut = false;
+	for (const w of manualWires.slice()) {
+		const k = w.cells.indexOf(idx);
+		if (k < 0) continue;
+		cut = true;
+		const parts = [];
+		if (k > 0) parts.push(w.cells.slice(0, k));
+		if (k < w.cells.length - 1) parts.push(w.cells.slice(k + 1));
+		const i = manualWires.indexOf(w);
+		if (i >= 0) manualWires.splice(i, 1);
+		for (const part of parts) {
+			if (part.length < 2) continue;
+			const nodes = [part[0], part[part.length - 1]];
+			manualWires.push({ color: w.color, cells: part.slice(), nodes, segs: [part.length - 1] });
+		}
+		if (k > 0 && !circles.has(w.cells[k - 1])) circles.set(w.cells[k - 1], { color: w.color, small: false, manual: true });
+		if (k < w.cells.length - 1 && !circles.has(w.cells[k + 1])) circles.set(w.cells[k + 1], { color: w.color, small: false, manual: true });
+	}
+	if (circles.has(idx)) circles.delete(idx);
+	const p = {
+		x, y, idx,
+		dir: 1, // East (Right), 0=N, 1=E, 2=S, 3=W matching dirs
+		R: 10.0,
+		efficiency: 0.70,
+		limited: !unlimited,
+		dV: 0,
+		lastPower: 0,
+		lastFlow: 0,
+		lastDeltaP: 0,
+		lastEff: 0,
+		lastHeat: 0
+	};
+	pumps.push(p);
+	selectedItem = { kind: 'pump', ref: p };
+	bus.emit('air:changed');
+	bus.emit('wire:placed');
+	recompute();
+	renderProperties();
+	logger(`Placed air pump at ${x},${y}` + (cut ? ' (cut wire → junction)' : ''));
+}
+function returnPump(p) {
+	const i = pumps.indexOf(p);
+	if (i < 0) return;
+	pumps.splice(i, 1);
+	if (selectedItem && selectedItem.kind === 'pump' && selectedItem.ref === p) selectedItem = null;
+	if (p.limited) INV.pump.count++;
+	bus.emit('air:changed');
+	bus.emit('wire:placed');
+	recompute();
+	renderProperties();
+	logger('Returned air pump', 'sys');
+}
+
+// Place or select a Piston (2x1 sealed movable obstacle)
+function placePiston(x, y) {
+	if (x < 0 || x >= GRID_W || y < 0 || y >= GRID_H) return;
+	const idx = y * GRID_W + x;
+	const existing = pistons.find(p => {
+		const x0 = Math.round(p.pos), y0 = p.y;
+		if (p.axis === 'h') return (x0 === x || x0 + 1 === x) && y0 === y;
+		else return p.x === x && (y0 === y || y0 + 1 === y);
+	});
+	if (existing) { selectedItem = { kind: 'piston', ref: existing }; renderProperties(); return; }
+	if (!unlimited && INV.piston.count <= 0) { logger('No piston left', 'err'); return; }
+
+	let axis = null;
+	const hFit = (x + 1 < GRID_W) && grid[idx] === 0 && grid[idx + 1] === 0 && !blocked[idx] && !blocked[idx + 1];
+	const vFit = (y + 1 < GRID_H) && grid[idx] === 0 && grid[idx + GRID_W] === 0 && !blocked[idx] && !blocked[idx + GRID_W];
+
+	const isVertTunnel = (x === 0 || grid[idx - 1] === 1) && (x === GRID_W - 1 || grid[idx + 1] === 1);
+	const isHorizTunnel = (y === 0 || grid[idx - GRID_W] === 1) && (y === GRID_H - 1 || grid[idx + GRID_W] === 1);
+
+	if (isVertTunnel && vFit) axis = 'v';
+	else if (isHorizTunnel && hFit) axis = 'h';
+	else if (hFit) axis = 'h';
+	else if (vFit) axis = 'v';
+	else { logger('Piston needs a 2x1 corridor space', 'err'); return; }
+
+	if (!unlimited) INV.piston.count--;
+	const p = {
+		id: ++pistonIdSeq,
+		x, y,
+		axis,
+		pos: axis === 'h' ? x : y,
+		vel: 0,
+		friction: 50,
+		damping: 200,
+		mass: 100,
+		limited: !unlimited,
+		lastFpress: 0,
+		lastFfric: 0,
+		blockedWall: false
+	};
+	pistons.push(p);
+	syncPistonOccupancy();
+	selectedItem = { kind: 'piston', ref: p };
+	bus.emit('air:changed');
+	renderProperties();
+	startSimLoop();
+	logger(`Placed piston (2x1 ${axis === 'h' ? 'horizontal' : 'vertical'}) at ${x},${y}`);
+}
+function returnPiston(p) {
+	const i = pistons.indexOf(p);
+	if (i < 0) return;
+	pistons.splice(i, 1);
+	if (selectedItem && selectedItem.kind === 'piston' && selectedItem.ref === p) selectedItem = null;
+	if (p.limited) INV.piston.count++;
+	syncPistonOccupancy();
+	bus.emit('air:changed');
+	renderProperties();
+	logger('Returned piston', 'sys');
+}
+
 // Double-click handler: return the battery/wire/lamp under the cursor.
 // While a plan is pending (a/b strategies awaiting Enter/Esc) a
 // double-click must not discard or return anything. Obstacle cells only
@@ -1050,6 +1227,14 @@ function handleReturnAt(x, y) {
 	if (valve) { if (selectedItem && selectedItem.kind === 'pipevalve' && selectedItem.ref === valve) selectedItem = null; returnPipeValve(valve); return; }
 	const portal = pipePortals.find(p => p.a === idx || p.b === idx);
 	if (portal) { if (selectedItem && selectedItem.kind === 'pipeportal' && selectedItem.ref === portal) selectedItem = null; returnPipePortal(portal); return; }
+	const pump = pumps.find(p => p.idx === idx);
+	if (pump) { if (selectedItem && selectedItem.kind === 'pump' && selectedItem.ref === pump) selectedItem = null; returnPump(pump); return; }
+	const piston = pistons.find(p => {
+		const x0 = Math.round(p.pos), y0 = p.y;
+		if (p.axis === 'h') return (x0 === x || x0 + 1 === x) && y0 === y;
+		else return p.x === x && (y0 === y || y0 + 1 === y);
+	});
+	if (piston) { if (selectedItem && selectedItem.kind === 'piston' && selectedItem.ref === piston) selectedItem = null; returnPiston(piston); return; }
 	logger('Nothing to return here', 'sys');
 }
 
@@ -1070,6 +1255,14 @@ function pickItemAt(x, y) {
 	if (valve) return { kind: 'pipevalve', ref: valve };
 	const portal = pipePortals.find(p => p.a === idx || p.b === idx);
 	if (portal) return { kind: 'pipeportal', ref: portal, endpoint: idx };
+	const pump = pumps.find(p => p.idx === idx);
+	if (pump) return { kind: 'pump', ref: pump };
+	const piston = pistons.find(p => {
+		const x0 = Math.round(p.pos), y0 = p.y;
+		if (p.axis === 'h') return (x0 === x || x0 + 1 === x) && y0 === y;
+		else return p.x === x && (y0 === y || y0 + 1 === y);
+	});
+	if (piston) return { kind: 'piston', ref: piston };
 	const bat = manualBatteries.find(b => b.poles.includes(idx));
 	if (bat) return { kind: 'battery', ref: bat };
 	const wire = manualWires.find(w => w.cells.includes(idx));
@@ -1119,6 +1312,10 @@ function pointerDown(x, y) {
 		placePipeValve(x, y);
 	} else if (activeTool === 'pipeportal') {
 		placePipePortal(x, y);
+	} else if (activeTool === 'piston') {
+		placePiston(x, y);
+	} else if (activeTool === 'pump') {
+		placePump(x, y);
 	} else if (activeTool === 'select') {
 		selectedItem = pickItemAt(x, y);
 		renderProperties();

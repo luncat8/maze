@@ -80,6 +80,8 @@ const GOD_ITEMS = [
   { id: 'airsink', label: 'Air Sink', tool: 'airsink' },
   { id: 'pipevalve',  label: 'Pipe Valve',  tool: 'pipevalve'  },
   { id: 'pipeportal', label: 'Pipe Portal', tool: 'pipeportal' },
+  { id: 'piston',     label: 'Piston (2x1)',tool: 'piston'     },
+  { id: 'pump',       label: 'Air Pump',    tool: 'pump'       },
   { id: 'metal',  label: 'Metal/Ground',tool: 'metal' },
 ];
 let unlimited = false; // true when the active selection is an unlimited GODMODE item
@@ -99,6 +101,8 @@ const INV = {
 	airsink: { type: 'airsink', count: 1, label: 'Air Sink' },
 	pipevalve:  { type: 'pipevalve',  count: 1, label: 'Pipe Valve'  },
 	pipeportal: { type: 'pipeportal', count: 1, label: 'Pipe Portal' },
+	piston:     { type: 'piston',     count: 1, label: 'Piston' },
+	pump:       { type: 'pump',       count: 1, label: 'Air Pump' },
 };
 // Single colorless segment pool (no red/blue split). Map len(>=1) -> count available.
 const WIRES = new Map();
@@ -135,6 +139,15 @@ const airSources = [];               // placed air pressure sources: { x, y, idx
 const airSinks = [];                 // placed air pressure sinks: { x, y, idx, limited, rate }
 const pipeValves  = [];              // placed pipe valves: { x, y, idx, limited, open }
 const pipePortals = [];              // placed pipe portals: { a, b, limited, open }   both endpoints set
+const pistons = [];                  // placed pistons: { id, x, y, axis, pos, vel, friction, damping, mass, limited, lastFpress, lastFfric, blockedWall }
+const pumps = [];                    // placed pumps: { x, y, idx, dir, R, efficiency, limited, dV, lastPower, lastFlow, lastDeltaP, lastEff, lastHeat }
+let pistonIdSeq = 0;
+const PUMP_DIRS = [
+	{ dx: 0,  dy: -1, arrow: '↑', label: 'North (Up)' },
+	{ dx: 1,  dy: 0,  arrow: '→', label: 'East (Right)' },
+	{ dx: 0,  dy: 1,  arrow: '↓', label: 'South (Down)' },
+	{ dx: -1, dy: 0,  arrow: '←', label: 'West (Left)' }
+];
 let pendingPortal = null;            // UI ghost only, never in pipePortals: { a }
 let selectedItem = null;            // selected maze item: { kind: 'lamp'|'wire'|'battery'|'node', ref }
 let lampBaseEff = 100;              // default luminous efficacy (lm/W) for new non-wired lamps
@@ -236,6 +249,9 @@ const pressure = new Float64Array(HEAT_N);   // n·R·T_abs (Pa)
 const velX = new Float64Array(HEAT_N), velY = new Float64Array(HEAT_N); // cell velocity (Pressure arrows)
 const cellParticles = [];                // per-cell: array of {x, y, vx, vy, age}
 const cellOpen = new Float32Array(HEAT_N).fill(1); // 0..1 per-cell openness; 1 = open corridor, lower = throttled by valve/portal
+const airVol = new Float64Array(HEAT_N).fill(CELL_VOL); // per-cell air volume (m^3)
+const pistonOcc = new Float32Array(HEAT_N).fill(0); // 0..1 per-cell piston occupancy fraction
+const PISTON_FULL = 0.999;
 const G_PORTAL = 2e-5;                     // kg/(Pa·s) pressure-driven mass flux for portal link (start == G_FLOW)
 function syncCellOpen() {
 	cellOpen.fill(1);
@@ -252,12 +268,28 @@ function cellOccupied(idx) {
 		|| airSinks.some(s => s.idx === idx)
 		|| pipeValves.some(v => v.idx === idx)
 		|| pipePortals.some(p => p.a === idx || p.b === idx)
+		|| pumps.some(p => p.idx === idx)
+		|| pistons.some(p => {
+			const x0 = Math.round(p.pos), y0 = p.y;
+			if (p.axis === 'h') return (y0 * GRID_W + x0 === idx) || (y0 * GRID_W + x0 + 1 === idx);
+			else return (p.x + y0 * GRID_W === idx) || (p.x + (y0 + 1) * GRID_W === idx);
+		})
 		|| manualWires.some(w => w.cells.includes(idx))
 		|| manualBatteries.some(b => b.poles.includes(idx));
 }
 function seedAir() {
 	const pAmb = N0 * R_SPEC * T_AMB * P_SCALE;
-	for (let i = 0; i < airN.length; i++) { airN[i] = N0; airU[i] = 0; temp[i] = 0; pressure[i] = pAmb; }
+	airVol.fill(CELL_VOL);
+	pistonOcc.fill(0);
+	if (typeof syncPistonOccupancy === 'function') syncPistonOccupancy();
+	for (let i = 0; i < airN.length; i++) {
+		const occ = pistonOcc[i];
+		const frac = occ >= PISTON_FULL ? 0 : Math.max(0, 1.0 - occ);
+		airN[i] = frac * N0;
+		airU[i] = 0;
+		temp[i] = 0;
+		pressure[i] = (typeof isAir === 'function' ? isAir(i) : (grid[i] === 0 && !blocked[i])) ? pAmb : 0;
+	}
 	for (let i = 0; i < cellParticles.length; i++) cellParticles[i].length = 0;
 	for (let i = 0; i < HEAT_N; i++) cellParticles.push([]);
 }
@@ -322,6 +354,8 @@ function updateStatus(x, y) {
 		: activeTool === 'airsink' ? 'Place Air Sink' + (unlimited ? ' (∞)' : ' ×' + INV.airsink.count)
 		: activeTool === 'pipevalve' ? 'Place Pipe Valve' + (unlimited ? ' (∞)' : ' ×' + INV.pipevalve.count)
 		: activeTool === 'pipeportal' ? 'Place Pipe Portal' + (unlimited ? ' (∞)' : ' ×' + INV.pipeportal.count)
+		: activeTool === 'piston' ? 'Place Piston (2x1)' + (unlimited ? ' (∞)' : ' ×' + INV.piston.count)
+		: activeTool === 'pump' ? 'Place Air Pump' + (unlimited ? ' (∞)' : ' ×' + INV.pump.count)
 		: activeTool === 'node' ? 'Place Node (' + selectedColor + ')'
 		: activeTool === 'eraser' ? 'Eraser'
 		: activeTool === 'wall' ? 'Toggle Wall'

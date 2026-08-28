@@ -256,6 +256,29 @@ const BIND_FNS = {
 		openHead: p => (p.open * 100).toFixed(0) + '%',
 		partner:  p => cellLabel(p.a === (selectedItem && selectedItem.endpoint) ? p.b : p.a),
 	},
+	piston: {
+		cells:    p => `(${p.x},${p.y})–(${p.axis === 'h' ? p.x + 1 : p.x},${p.axis === 'h' ? p.y : p.y + 1})`,
+		axis:     p => p.axis === 'h' ? 'Horizontal (X)' : 'Vertical (Y)',
+		fricHead: p => (p.friction != null ? p.friction : 50).toFixed(0) + ' N',
+		speed:    p => Math.abs(p.vel || 0).toFixed(2) + ' cells/s' + (p.vel ? (p.vel > 0 ? ' (+)' : ' (−)') : ''),
+		deltaP:   p => Math.abs(p.lastFpress || 0).toFixed(0) + ' Pa',
+		fPress:   p => (p.lastFpress || 0).toFixed(1) + ' N',
+		fFric:    p => (p.lastFfric || 0).toFixed(1) + ' N',
+		status:   p => p.blockedWall ? 'Wall Contact' : Math.abs(p.vel || 0) < 0.01 ? 'Locked (Friction)' : 'Moving',
+	},
+	pump: {
+		pos:       p => cellLabel(p.idx),
+		dirHead:   p => PUMP_DIRS[p.dir || 0].label + ' ' + PUMP_DIRS[p.dir || 0].arrow,
+		rHead:     p => (p.R != null ? p.R : 10).toFixed(1) + ' Ω',
+		effHead:   p => Math.round((p.efficiency != null ? p.efficiency : 0.7) * 100) + '%',
+		dV:        p => (p.dV ? p.dV.toFixed(2) : '0.00') + ' V',
+		power:     p => p.limited ? (p.lastPower || 0).toFixed(2) + ' W' : (p.lastPower || 10).toFixed(1) + ' W (GODMODE)',
+		flow:      p => `${((p.lastFlow || 0) * 1000).toFixed(1)} g/s (${((p.lastFlow || 0) / AIR_RHO * 1000).toFixed(1)} L/s)`,
+		head:      p => (p.lastDeltaP || 0).toFixed(0) + ' Pa',
+		actualEff: p => `${Math.round((p.lastEff || 0) * 100)}%`,
+		heat:      p => `${(p.lastHeat || 0).toFixed(2)} W`,
+		status:    p => (p.lastPower || 0) > 0.05 ? ((p.lastFlow || 0) > 1e-4 ? 'Pumping' : 'Stalled') : 'Off',
+	},
 	node: Object.assign({
 		pos:   r => (r % GRID_W) + ',' + ((r / GRID_W) | 0),
 		color: r => { const n = circles.get(r); return n ? n.color : '—'; },
@@ -274,6 +297,8 @@ const INPUT_FNS = {
 	airsink: { rate: s => s.rate },
 	pipevalve:  { open: v => v.open },
 	pipeportal: { open: p => p.open },
+	piston:     { friction: p => p.friction != null ? p.friction : 50 },
+	pump:       { dir: p => p.dir || 0, R: p => p.R != null ? p.R : 10, efficiency: p => Math.round((p.efficiency != null ? p.efficiency : 0.7) * 100) },
 };
 function computeInput(kind, field, ref) {
 	const fn = INPUT_FNS[kind] && INPUT_FNS[kind][field];
@@ -291,7 +316,7 @@ function cacheRefs(root) {
 }
 
 // input field → the `data-bind` head span it updates live (e.g. 'effHead').
-const HEAD_BIND = { efficiency: 'effHead', R: 'rHead', srcT: 'srcTHead', rate: 'rateHead', open: 'openHead' };
+const HEAD_BIND = { efficiency: 'effHead', R: 'rHead', srcT: 'srcTHead', rate: 'rateHead', open: 'openHead', friction: 'fricHead', dir: 'dirHead' };
 
 function cellLabel(idx) { return (idx % GRID_W) + ',' + ((idx / GRID_W) | 0); }
 
@@ -301,10 +326,15 @@ function makeInputHandler(kind, field, ref, root) {
 		const v = el.type === 'checkbox' ? el.checked : +el.value;
 		if (field === 'color') ref.color = el.value;
 		else if (field === 'switch') ref.value = el.checked;
-		else if (field === 'efficiency') { ref.efficiency = v; ref.lumen = v * P_REF; }
+		else if (field === 'efficiency') {
+			if (kind === 'pump') ref.efficiency = v / 100;
+			else { ref.efficiency = v; ref.lumen = v * P_REF; }
+		}
 		else if (field === 'R') ref.R = v;
 		else if (field === 'srcT') ref.temp = v;
 		else if (field === 'rate') ref.rate = v;
+		else if (field === 'friction') ref.friction = v;
+		else if (field === 'dir') ref.dir = v | 0;
 		const head = HEAD_BIND[field];
 		if (head && root._refs && root._refs.bind[head]) {
 			const t = computeBind(kind, head, ref);
@@ -321,6 +351,7 @@ function makeInputHandler(kind, field, ref, root) {
 		}
 		if (field === 'srcT' || field === 'rate') { startSimLoop(); render(); return; }
 		if (field === 'open') { ref.open = v; syncCellOpen(); startSimLoop(); render(); return; }
+		if (field === 'friction' || field === 'dir') { startSimLoop(); render(); return; }
 	};
 }
 
@@ -388,6 +419,8 @@ const panelBinders = {
 	airsink: makeBinder('airsink', (ref) => returnAirSink(ref)),
 	pipevalve:  makeBinder('pipevalve',  (ref) => returnPipeValve(ref)),
 	pipeportal: makeBinder('pipeportal', (ref) => returnPipePortal(ref)),
+	piston:     makeBinder('piston',     (ref) => returnPiston(ref)),
+	pump:       makeBinder('pump',       (ref) => returnPump(ref)),
 	node: makeBinder('node', null),
 };
 
@@ -884,6 +917,102 @@ function render() {
 	pipePortals.forEach(p => { drawPortalLink(p); drawPipeValve(p.a, p.open); drawPipeValve(p.b, p.open); });
 	pipeValves.forEach(v => drawPipeValve(v.idx, v.open));
 	if (pendingPortal) drawPortalStub(pendingPortal.a);
+
+	// Pump Blocks: sealed wall body with 4-way direction arrow (0=N, 1=E, 2=S, 3=W)
+	function drawPump(p) {
+		const cx = (p.x + 0.5) * CELL_SIZE;
+		const cy = (p.y + 0.5) * CELL_SIZE;
+		const x0 = p.x * CELL_SIZE, y0 = p.y * CELL_SIZE;
+		ctx.fillStyle = '#1e293b';
+		ctx.fillRect(x0 + 1, y0 + 1, CELL_SIZE - 2, CELL_SIZE - 2);
+		ctx.fillStyle = '#0f172a';
+		ctx.fillRect(x0 + 3, y0 + 3, CELL_SIZE - 6, CELL_SIZE - 6);
+
+		const vColor = cellColor.get(p.idx);
+		ctx.strokeStyle = vColor || '#475569';
+		ctx.lineWidth = vColor ? 2 : 1;
+		ctx.strokeRect(x0 + 1.5, y0 + 1.5, CELL_SIZE - 3, CELL_SIZE - 3);
+
+		const d = PUMP_DIRS[p.dir || 0];
+		const running = (p.lastPower || 0) > 0.05;
+		const stalled = running && (p.lastFlow || 0) < 1e-4;
+		const arrowColor = running ? (stalled ? '#f59e0b' : '#06b6d4') : '#64748b';
+		ctx.strokeStyle = arrowColor;
+		ctx.fillStyle = arrowColor;
+		ctx.lineWidth = 2.5;
+		ctx.lineCap = 'round';
+		ctx.lineJoin = 'round';
+
+		const L = CELL_SIZE * 0.32;
+		const tipX = cx + d.dx * L, tipY = cy + d.dy * L;
+		const tailX = cx - d.dx * L, tailY = cy - d.dy * L;
+		ctx.beginPath();
+		ctx.moveTo(tailX, tailY);
+		ctx.lineTo(tipX, tipY);
+		ctx.stroke();
+
+		const headL = CELL_SIZE * 0.16;
+		const perpX = -d.dy, perpY = d.dx;
+		ctx.beginPath();
+		ctx.moveTo(tipX, tipY);
+		ctx.lineTo(tipX - d.dx * headL + perpX * headL * 0.7, tipY - d.dy * headL + perpY * headL * 0.7);
+		ctx.lineTo(tipX - d.dx * headL - perpX * headL * 0.7, tipY - d.dy * headL - perpY * headL * 0.7);
+		ctx.closePath();
+		ctx.fill();
+	}
+
+	// Pistons: 2x1 sealed movable obstacle
+	function drawPiston(p) {
+		const isH = p.axis === 'h';
+		const px = isH ? p.pos * CELL_SIZE : p.x * CELL_SIZE;
+		const py = isH ? p.y * CELL_SIZE : p.pos * CELL_SIZE;
+		const pw = isH ? CELL_SIZE * 2 - 2 : CELL_SIZE - 2;
+		const ph = isH ? CELL_SIZE - 2 : CELL_SIZE * 2 - 2;
+
+		ctx.fillStyle = '#334155';
+		ctx.fillRect(px + 1, py + 1, pw, ph);
+
+		ctx.strokeStyle = '#64748b';
+		ctx.lineWidth = 1.5;
+		ctx.strokeRect(px + 1.5, py + 1.5, pw - 1, ph - 1);
+
+		ctx.fillStyle = '#38bdf8';
+		if (isH) {
+			ctx.fillRect(px + 1, py + 1, 3, ph);
+			ctx.fillRect(px + pw - 2, py + 1, 3, ph);
+		} else {
+			ctx.fillRect(px + 1, py + 1, pw, 3);
+			ctx.fillRect(px + 1, py + ph - 2, pw, 3);
+		}
+
+		const midX = px + pw / 2, midY = py + ph / 2;
+		ctx.fillStyle = '#1e293b';
+		ctx.beginPath();
+		ctx.arc(midX, midY, Math.min(pw, ph) * 0.22, 0, Math.PI * 2);
+		ctx.fill();
+		ctx.strokeStyle = '#94a3b8';
+		ctx.lineWidth = 1;
+		ctx.stroke();
+
+		if (Math.abs(p.vel || 0) > 0.05) {
+			ctx.strokeStyle = '#fde047';
+			ctx.lineWidth = 1.5;
+			const dirSign = Math.sign(p.vel);
+			ctx.beginPath();
+			if (isH) {
+				ctx.moveTo(midX - dirSign * 4, midY - 3);
+				ctx.lineTo(midX + dirSign * 4, midY);
+				ctx.lineTo(midX - dirSign * 4, midY + 3);
+			} else {
+				ctx.moveTo(midX - 3, midY - dirSign * 4);
+				ctx.lineTo(midX, midY + dirSign * 4);
+				ctx.lineTo(midX + 3, midY - dirSign * 4);
+			}
+			ctx.stroke();
+		}
+	}
+	pumps.forEach(p => drawPump(p));
+	pistons.forEach(p => drawPiston(p));
 	// Predicted junction markers for the active plan (during drag or awaiting Apply).
 	function drawPlanJunctions(path, segs) {
 		if (!path || path.length < 2 || !segs || !segs.length) return;

@@ -131,6 +131,8 @@ function circuitSimulate() {
 	// ---- cell-type sets -------------------------------------------
 	const lampIdx = new Set(lamps.map(l => l.idx));
 	const lampByIdx = new Map(lamps.map(l => [l.idx, l]));
+	const pumpIdx = new Set(pumps.map(p => p.idx));
+	const pumpByIdx = new Map(pumps.map(p => [p.idx, p]));
 	const switchIdx = new Set(switches.map(s => s.idx));
 	const poleSet = new Set();
 	manualBatteries.forEach(b => b.poles.forEach(p => poleSet.add(p)));
@@ -138,11 +140,12 @@ function circuitSimulate() {
 	function typeOf(n) {
 		if (poleSet.has(n)) return 'pole';
 		if (lampIdx.has(n)) return 'lamp';
+		if (pumpIdx.has(n)) return 'pump';
 		if (switchIdx.has(n)) return 'switch';
 		return 'wire';
 	}
-	// Resistance of one adj edge between endpoints u and v. A lamp/switch
-	// is split into two halves (one per terminal edge); a GODMODE lamp is a
+	// Resistance of one adj edge between endpoints u and v. A lamp/switch/pump
+	// is split into two halves (one per terminal edge); a GODMODE lamp/pump is a
 	// near-ideal conductor (self-powered, not a load).
 	function edgeR(u, v) {
 		const tu = typeOf(u), tv = typeOf(v);
@@ -150,17 +153,22 @@ function circuitSimulate() {
 		if (isWire(tu) && isWire(tv)) return R_wire;
 		if (tu === 'lamp' || tv === 'lamp') {
 			const l = lampByIdx.get(tu === 'lamp' ? u : v);
-			// GODMODE (self-powered) lamp: near-ideal conductor. BUILD lamp: use
-			// its own per-instance resistance (fallback to R_lamp) so the slider
-			// changes the nodal solve, the lamp's ΔV, and its Joule heat.
 			return (l && !l.limited) ? R_switch / 2 : ((l && l.R != null ? l.R : R_lamp) / 2);
+		}
+		if (tu === 'pump' || tv === 'pump') {
+			const p = pumpByIdx.get(tu === 'pump' ? u : v);
+			return (p && !p.limited) ? R_switch / 2 : ((p && p.R != null ? p.R : 10.0) / 2);
 		}
 		if (tu === 'switch' || tv === 'switch') return R_switch / 2;
 		return R_wire;
 	}
-		// Reset every lamp's voltage drop; only lamps inside a closed loop
+		// Reset every lamp and pump voltage drop; only loads inside a closed loop
 		// will be given a non-zero value below.
 		lamps.forEach(l => { l.dV = 0; });
+		pumps.forEach(p => {
+			if (!p.limited) { p.dV = 10; p.lastPower = 10; }
+			else { p.dV = 0; p.lastPower = 0; }
+		});
 
 	// ---- per-component nodal solve (Norton equivalent) ------------
 	// One system per connected component that contains a battery. ALL
@@ -267,9 +275,9 @@ function circuitSimulate() {
 		let vmin = Infinity, vmax = -Infinity;
 		comp.forEach(n => { const vn = V.get(n); if (vn < vmin) vmin = vn; if (vn > vmax) vmax = vn; });
 
-		let hasLamp = false;
+		let hasLoad = false;
 		comp.forEach(n => {
-			if (lampIdx.has(n)) hasLamp = true;
+			if (lampIdx.has(n) || pumpIdx.has(n)) hasLoad = true;
 			const vn = V.get(n);
 			voltages.set(n, vn);
 			resPos.set(n, ((Vbat_total - vn) / Vbat_total) * Req);   // R to + stack
@@ -278,16 +286,24 @@ function circuitSimulate() {
 			energized.add(n);
 		});
 
-		// Lamp voltage drop = difference between its two conductor neighbours.
+		// Lamp and pump voltage drops = difference between two conductor neighbours.
 		lamps.forEach(l => {
 			if (netFind(l.idx) !== root) return;
 			const nbrs = [...(adj.get(l.idx) || [])].filter(nn => netFind(nn) === root);
 			if (nbrs.length >= 2) l.dV = V.get(nbrs[0]) - V.get(nbrs[1]);
 			else if (nbrs.length === 1) l.dV = V.get(nbrs[0]) - V.get(l.idx);
 		});
+		pumps.forEach(p => {
+			if (!p.limited) return;
+			if (netFind(p.idx) !== root) return;
+			const nbrs = [...(adj.get(p.idx) || [])].filter(nn => netFind(nn) === root);
+			if (nbrs.length >= 2) p.dV = Math.abs(V.get(nbrs[0]) - V.get(nbrs[1]));
+			else if (nbrs.length === 1) p.dV = Math.abs(V.get(nbrs[0]) - V.get(p.idx));
+			p.lastPower = (p.dV * p.dV) / (p.R || 10.0);
+		});
 
-		// Closed loop with a battery but no lamp -> short (magenta).
-		if (!hasLamp) comp.forEach(n => shorts.add(n));
+		// Closed loop with a battery but no load -> short (magenta).
+		if (!hasLoad) comp.forEach(n => shorts.add(n));
 	});
 
 	// Keep battery poles merged in DSU for any compatibility use; lamps no
@@ -325,6 +341,7 @@ function circuitSimulate() {
 let fieldV = null;                 // Float64Array(N): current potential (V)
 let fieldSystems = [];             // one relaxation system per battery-fed component
 let fieldLampByIdx = new Map();    // idx -> lamp (for the dV readout)
+let fieldPumpByIdx = new Map();    // idx -> pump (for load detection & readout)
 const FIELD_SWEEPS_PER_FRAME = 50; // relaxation steps advanced each frame
 let simRunning = false;            // unified sim (field + heat) loop is active
 let fieldDirty = false;            // force at least one more field frame
@@ -333,7 +350,9 @@ let heatDirty = false;             // force at least one more heat frame
 function fieldSimulate() {
 	// 1) Per-cell resistance grid + connected components.
 	fieldLampByIdx = new Map(lamps.map(l => [l.idx, l]));
+	fieldPumpByIdx = new Map(pumps.map(p => [p.idx, p]));
 	const switchByIdx = new Map(switches.map(s => [s.idx, s]));
+	const pumpByIdx = fieldPumpByIdx;
 
 	const wireCells = new Set();
 	manualWires.forEach(w => w.cells.forEach(c => wireCells.add(c)));
@@ -351,6 +370,10 @@ function fieldSimulate() {
 			// use their own per-instance resistance so the slider actually drives
 			// the solve (and thus voltage drop + Joule heat).
 			return l.limited ? (l.R != null ? l.R : R_lamp) : R_wire;
+		}
+		if (pumpByIdx.has(idx)) {
+			const p = pumpByIdx.get(idx);
+			return p.limited ? (p.R != null ? p.R : 10.0) : R_wire;
 		}
 		if (switchByIdx.has(idx)) {
 			const s = switchByIdx.get(idx);
@@ -528,6 +551,10 @@ function fieldPublish() {
 	cellColor.clear(); shorts.clear(); energized.clear();
 	voltages.clear(); resPos.clear(); resNeg.clear();
 	lamps.forEach(l => { l.dV = 0; });
+	pumps.forEach(p => {
+		if (!p.limited) { p.dV = 10; p.lastPower = 10; }
+		else { p.dV = 0; p.lastPower = 0; }
+	});
 
 	for (const s of fieldSystems) {
 		const compBatts = s.compBatts;
@@ -547,9 +574,9 @@ function fieldPublish() {
 		let vmin = Infinity, vmax = -Infinity;
 		for (const n of s.comp) { const vn = fieldV[n]; if (vn < vmin) vmin = vn; if (vn > vmax) vmax = vn; }
 
-		let hasLamp = false;
+		let hasLoad = false;
 		for (const n of s.comp) {
-			if (fieldLampByIdx.has(n)) hasLamp = true;
+			if (fieldLampByIdx.has(n) || fieldPumpByIdx.has(n)) hasLoad = true;
 			const vn = fieldV[n];
 			voltages.set(n, vn);
 			cellColor.set(n, voltageColor(vn, vmin, vmax));
@@ -565,7 +592,16 @@ function fieldPublish() {
 			if (list.length >= 2) l.dV = fieldV[list[0][0]] - fieldV[list[1][0]];
 			else l.dV = fieldV[list[0][0]] - fieldV[l.idx];
 		});
-		if (!hasLamp) for (const n of s.comp) shorts.add(n);
+		pumps.forEach(p => {
+			if (!p.limited) return;
+			if (netFind(p.idx) !== s.root) return;
+			const list = s.Ga.get(p.idx);
+			if (!list || list.length === 0) return;
+			if (list.length >= 2) p.dV = Math.abs(fieldV[list[0][0]] - fieldV[list[1][0]]);
+			else p.dV = Math.abs(fieldV[list[0][0]] - fieldV[p.idx]);
+			p.lastPower = (p.dV * p.dV) / (p.R || 10.0);
+		});
+		if (!hasLoad) for (const n of s.comp) shorts.add(n);
 	}
 	// The electric field is live, so heat tracks it every frame. Build the
 	// shared per-cell R grid + Joule heat sources now; the unified tick's
@@ -583,6 +619,7 @@ function fieldPublish() {
 function computeHeatSource() {
 	const N = GRID_W * GRID_H;
 	const lampByIdx = new Map(lamps.map(l => [l.idx, l]));        // from global `lamps`
+	const pumpByIdx = new Map(pumps.map(p => [p.idx, p]));
 	const switchOn = new Set(switches.filter(s => s.value).map(s => s.idx)); // closed only
 	const wireCells = new Set();
 	manualWires.forEach(w => w.cells.forEach(c => wireCells.add(c)));
@@ -601,6 +638,7 @@ function computeHeatSource() {
 		let r;
 		if (blocked[i]) r = Infinity;
 		else if (lampByIdx.has(i)) { const l = lampByIdx.get(i); r = l.limited ? l.R : R_wire; }
+		else if (pumpByIdx.has(i)) { const p = pumpByIdx.get(i); r = p.limited ? p.R : R_wire; }
 		else if (switchOn.has(i)) r = R_switch;
 		else if (metalCells[i]) r = R_metal;
 		else if (wireCells.has(i)) r = R_wire;
@@ -628,6 +666,7 @@ function computeHeatSource() {
 	// power becomes heat; power is the emitted light divided by luminous efficacy.
 	// Scaled by HEAT_GAIN so a default lamp reaches a watchable ~5 K/s gradient.
 	for (const l of lamps) if (!l.limited) heatSource[l.idx] += (l.lumen / LM_EFFICACY) * HEAT_GAIN;
+	for (const p of pumps) if (p.lastHeat) heatSource[p.idx] += p.lastHeat;
 }
 
 // ---- Air pressure engine -------------------------------------------------
@@ -701,6 +740,7 @@ function simulate() {
 	// Global legacy normalization: a loaded pre-feature save has no R yet,
 	// which would otherwise produce NaN resistance in edgeR/computeHeatSource.
 	for (const l of lamps) if (l.R == null) l.R = R_lamp;
+	for (const p of pumps) if (p.R == null) p.R = 10.0;
 	if (activeEngine === 'circuit') {
 		simRunning = false;  // stop the unified (field + heat) loop
 		fieldSystems = [];   // drop stale Field state when switching engines
