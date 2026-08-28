@@ -87,8 +87,9 @@ vm.createContext(sandbox);
 // ---------- Load project files ---------------------------------------------
 
 const files = ['state.js', 'maze.js', 'network.js', 'render.js', 'air.js', 'electric.js', 'ui.js'];
+const jsDir = fs.existsSync(path.join(__dirname, 'state.js')) ? __dirname : path.join(__dirname, 'js');
 for (const f of files) {
-	let src = fs.readFileSync(path.join(__dirname, 'js', f), 'utf8');
+	let src = fs.readFileSync(path.join(jsDir, f), 'utf8');
 	// The canvas reference must resolve to a stubbed element; the DOM stub
 	// already handles getElementById('ctx') but ensure canvas-specific props
 	// are present.
