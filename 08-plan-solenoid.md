@@ -1,6 +1,16 @@
 # Solenoid / Magnetic DC Machine — Implementation Plan
 
-Status: PLAN (not yet implemented). Author session notes 2026-08-29.
+Status: IMPLEMENTED (M1–M4; spring deferred). Author session notes 2026-08-29.
+
+**Rev 4 — review fixes (then implement).** What changed vs Rev 3:
+
+- **`pistons` stays the array.** `const bodies = pistons` is an alias; `createMechanicalBody()` is the factory. `moveAxis` defaults to `axis` so every existing piston is bit-for-bit Mode B (`axis === moveAxis`, span 2 along motion). Tests that `pistons.push({axis:'h', pos, ...})` keep working.
+- **Case A does not paint two adjacent rail rows.** The field engine 4-connects every finite-R cell, so two grid-adjacent conductor rows are a sheet (dead short). Case A therefore **bridges rails that sit on opposite sides of the 2-cell body**: the body's own two cells become conductors at `R_arm/2` (so the edge between them is `R_arm`) and couple to neighbouring wire/metal. No extra “forbid cross-rail edges” path — if the player paints a sheet, they get a sheet.
+- **Motion span is 1 cell in Case A** (long axis ⊥ motion, 2-wide carriage), **2 cells in Mode B**. Occupancy / `getChamber` / `faceBlocked` / wall limits are rectangle-based over `(axis, moveAxis)` and reduce to today's code when `axis === moveAxis`.
+- **`lastHeat` is conversion loss only:** `|Σ E·I|·(1−η)` dumped on the body cells. Per-edge `I²R` (including the armature) stays in the generic `computeHeatSource` loop — do not add `I_bridge² R_arm` a second time. `lastEMF = lastPower / lastCurrent` (signed).
+- **Rebuild `fieldSimulate()` every frame while any magnet exists** (Case A cells move; `E_e` tracks `v`). `electricActive()` is `batteries || magnets`.
+- **Gas `cv`:** `AIR_CV = AIR_CP − R_SPEC`, `T ↔ U` uses `cv`; mass advection carries excess enthalpy `h = c_p T_ex`; piston P–V work updates chamber `U` after the move (never as an extra force). `test_air.js` / `test_heat.js` are standalone mirrors and stay as they are.
+- **`K_B` default 40**, `σ_B = 0.5`, `r_max = 8`. Force on a dipole is end-gradient / 1/r (uniform B ⇒ `F = 0`); the demo places magnets where `∇B` is finite (rail ends, beside a wire). That is the physics, not a bug.
 
 **Rev 3 — proper field-based magneto-electric model.** What changed vs Rev 2:
 

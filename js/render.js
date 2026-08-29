@@ -2,7 +2,7 @@
 // Net view: the net's identity color. Electric view: battery terminal
 // color (r/b) from the simulation, grey when the net is unpowered.
 function viewColor(idx, netColor) {
-		return (colorView === 'electric' || colorView === 'voltage') ? (cellColor.get(idx) || '#9ca3af')
+		return (colorView === 'electric' || colorView === 'voltage' || colorView === 'bfield') ? (cellColor.get(idx) || '#9ca3af')
 		: (colorView === 'heat' || colorView === 'pressure' ? '#374151' : netColor);
 }
 
@@ -258,12 +258,25 @@ const BIND_FNS = {
 	},
 	piston: {
 		cells:    p => `(${p.x},${p.y})–(${p.axis === 'h' ? p.x + 1 : p.x},${p.axis === 'h' ? p.y : p.y + 1})`,
-		axis:     p => p.axis === 'h' ? 'Horizontal (X)' : 'Vertical (Y)',
+		axis:     p => {
+			const ma = bodyMoveAxis(p);
+			const ax = p.axis === 'h' ? 'H' : 'V';
+			return ma === p.axis ? (p.axis === 'h' ? 'Horizontal (X)' : 'Vertical (Y)') : `Long ${ax}, move ${ma === 'h' ? 'X' : 'Y'} (Case A)`;
+		},
 		fricHead: p => (p.friction != null ? p.friction : 50).toFixed(0) + ' N',
 		speed:    p => Math.abs(p.vel || 0).toFixed(2) + ' cells/s' + (p.vel ? (p.vel > 0 ? ' (+)' : ' (−)') : ''),
 		deltaP:   p => Math.abs(p.lastFpress || 0).toFixed(0) + ' Pa',
 		fPress:   p => (p.lastFpress || 0).toFixed(1) + ' N',
 		fFric:    p => (p.lastFfric || 0).toFixed(1) + ' N',
+		fCoil:    p => (p.lastFcoil || 0).toFixed(1) + ' N',
+		bz:       p => (p.lastBz || 0).toFixed(3),
+		emf:      p => (p.lastEMF || 0).toFixed(2) + ' V',
+		current:  p => (p.lastCurrent || 0).toFixed(3) + ' A',
+		magPower: p => (p.lastPower || 0).toFixed(2) + ' W',
+		magHeat:  p => (p.lastHeat || 0).toFixed(2) + ' W',
+		magHead:  p => (p.magStrength != null ? p.magStrength : 1).toFixed(2),
+		rArmHead: p => (p.R_arm != null ? p.R_arm : 2).toFixed(1) + ' Ω',
+		etaHead:  p => Math.round((p.efficiency != null ? p.efficiency : 0.85) * 100) + '%',
 		status:   p => p.blockedWall ? 'Wall Contact' : Math.abs(p.vel || 0) < 0.01 ? 'Locked (Friction)' : 'Moving',
 	},
 	pump: {
@@ -297,7 +310,7 @@ const INPUT_FNS = {
 	airsink: { rate: s => s.rate },
 	pipevalve:  { open: v => v.open },
 	pipeportal: { open: p => p.open },
-	piston:     { friction: p => p.friction != null ? p.friction : 50 },
+	piston:     { friction: p => p.friction != null ? p.friction : 50, magStrength: p => p.magStrength != null ? p.magStrength : 1, R_arm: p => p.R_arm != null ? p.R_arm : 2, efficiency: p => Math.round((p.efficiency != null ? p.efficiency : 0.85) * 100), magnet: p => !!p.magnet },
 	pump:       { dir: p => p.dir || 0, R: p => p.R != null ? p.R : 10, efficiency: p => Math.round((p.efficiency != null ? p.efficiency : 0.7) * 100) },
 };
 function computeInput(kind, field, ref) {
@@ -316,7 +329,7 @@ function cacheRefs(root) {
 }
 
 // input field → the `data-bind` head span it updates live (e.g. 'effHead').
-const HEAD_BIND = { efficiency: 'effHead', R: 'rHead', srcT: 'srcTHead', rate: 'rateHead', open: 'openHead', friction: 'fricHead', dir: 'dirHead' };
+const HEAD_BIND = { efficiency: 'effHead', R: 'rHead', srcT: 'srcTHead', rate: 'rateHead', open: 'openHead', friction: 'fricHead', dir: 'dirHead', magStrength: 'magHead', R_arm: 'rArmHead' };
 
 function cellLabel(idx) { return (idx % GRID_W) + ',' + ((idx / GRID_W) | 0); }
 
@@ -327,7 +340,7 @@ function makeInputHandler(kind, field, ref, root) {
 		if (field === 'color') ref.color = el.value;
 		else if (field === 'switch') ref.value = el.checked;
 		else if (field === 'efficiency') {
-			if (kind === 'pump') ref.efficiency = v / 100;
+			if (kind === 'pump' || kind === 'piston') ref.efficiency = v / 100;
 			else { ref.efficiency = v; ref.lumen = v * P_REF; }
 		}
 		else if (field === 'R') ref.R = v;
@@ -335,6 +348,9 @@ function makeInputHandler(kind, field, ref, root) {
 		else if (field === 'rate') ref.rate = v;
 		else if (field === 'friction') ref.friction = v;
 		else if (field === 'dir') ref.dir = v | 0;
+		else if (field === 'magStrength') ref.magStrength = v;
+		else if (field === 'R_arm') ref.R_arm = v;
+		else if (field === 'magnet') { ref.magnet = !!v; startSimLoop(); recompute(); return; }
 		const head = HEAD_BIND[field];
 		if (head && root._refs && root._refs.bind[head]) {
 			const t = computeBind(kind, head, ref);
@@ -351,7 +367,7 @@ function makeInputHandler(kind, field, ref, root) {
 		}
 		if (field === 'srcT' || field === 'rate') { startSimLoop(); render(); return; }
 		if (field === 'open') { ref.open = v; syncCellOpen(); startSimLoop(); render(); return; }
-		if (field === 'friction' || field === 'dir') { startSimLoop(); render(); return; }
+		if (field === 'friction' || field === 'dir' || field === 'magStrength' || field === 'R_arm') { startSimLoop(); render(); return; }
 	};
 }
 
@@ -385,8 +401,9 @@ function makeBinder(kind, onReturn) {
 			for (let i = 0; i < show.length; i++) {
 				const cond = show[i].getAttribute('data-show');
 				let vis = true;
-				if (cond === 'limited') vis = !!ref.limited;
-				else if (cond === 'paired') vis = !!ref.b; // only portals have a partner cell
+			if (cond === 'limited') vis = !!ref.limited;
+			else if (cond === 'paired') vis = !!ref.b; // only portals have a partner cell
+			else if (cond === 'magnet') vis = !!ref.magnet;
 				show[i].style.display = vis ? '' : 'none';
 			}
 			const b = root._refs.bind;
@@ -420,6 +437,7 @@ const panelBinders = {
 	pipevalve:  makeBinder('pipevalve',  (ref) => returnPipeValve(ref)),
 	pipeportal: makeBinder('pipeportal', (ref) => returnPipePortal(ref)),
 	piston:     makeBinder('piston',     (ref) => returnPiston(ref)),
+	solenoid:   makeBinder('piston',     (ref) => returnPiston(ref)),
 	pump:       makeBinder('pump',       (ref) => returnPump(ref)),
 	node: makeBinder('node', null),
 };
@@ -431,7 +449,7 @@ function renderProperties() {
 	if (!selectedItem) { panel.style.display = 'none'; currentRoot = null; currentKind = null; return; }
 	panel.style.display = 'block';
 	const b = panelBinders[selectedItem.kind];
-	const tplId = (selectedItem.kind === 'pipevalve' || selectedItem.kind === 'pipeportal') ? 'prop-tpl-pipe' : 'prop-tpl-' + selectedItem.kind;
+	const tplId = (selectedItem.kind === 'pipevalve' || selectedItem.kind === 'pipeportal') ? 'prop-tpl-pipe' : (selectedItem.kind === 'solenoid' ? 'prop-tpl-piston' : 'prop-tpl-' + selectedItem.kind);
 	const tpl = document.getElementById(tplId);
 	if (b && tpl && tpl.content) {
 		const root = document.createElement('div');
@@ -519,7 +537,7 @@ function render() {
 	// overdrawn by the voltage heatmap in electric/voltage views; this tint
 	// mainly shows unenergized metal (e.g. open branches, net view). The Heat
 	// view shows temperature instead, so skip this amber tint there.
-	if (colorView !== 'light' && colorView !== 'heat' && colorView !== 'pressure') {
+	if (colorView !== 'light' && colorView !== 'heat' && colorView !== 'pressure' && colorView !== 'bfield') {
 		ctx.fillStyle = '#b45309';
 		for (let i = 0; i < metalCells.length; i++) {
 			if (metalCells[i] && !blocked[i]) ctx.fillRect((i % GRID_W) * CELL_SIZE, ((i / GRID_W) | 0) * CELL_SIZE, CELL_SIZE, CELL_SIZE);
@@ -961,45 +979,63 @@ function render() {
 		ctx.fill();
 	}
 
-	// Pistons: 2x1 sealed movable obstacle
+	// Pistons: 2x1 sealed movable obstacle (plain or magnet)
 	function drawPiston(p) {
-		const isH = p.axis === 'h';
-		const px = isH ? p.pos * CELL_SIZE : p.x * CELL_SIZE;
-		const py = isH ? p.y * CELL_SIZE : p.pos * CELL_SIZE;
-		const pw = isH ? CELL_SIZE * 2 - 2 : CELL_SIZE - 2;
-		const ph = isH ? CELL_SIZE - 2 : CELL_SIZE * 2 - 2;
+		const r = bodyRect(p);
+		const px = r.x0 * CELL_SIZE, py = r.y0 * CELL_SIZE;
+		const pw = (r.x1 - r.x0) * CELL_SIZE - 2;
+		const ph = (r.y1 - r.y0) * CELL_SIZE - 2;
+		const mag = !!p.magnet;
+		const longH = p.axis === 'h';
+		const moveH = bodyMoveAxis(p) === 'h';
 
-		ctx.fillStyle = '#334155';
+		ctx.fillStyle = mag ? '#b45309' : '#334155';
 		ctx.fillRect(px + 1, py + 1, pw, ph);
 
-		ctx.strokeStyle = '#64748b';
+		ctx.strokeStyle = mag ? '#fbbf24' : '#64748b';
 		ctx.lineWidth = 1.5;
 		ctx.strokeRect(px + 1.5, py + 1.5, pw - 1, ph - 1);
 
-		ctx.fillStyle = '#38bdf8';
-		if (isH) {
-			ctx.fillRect(px + 1, py + 1, 3, ph);
-			ctx.fillRect(px + pw - 2, py + 1, 3, ph);
+		if (mag) {
+			ctx.fillStyle = '#ef4444';
+			if (longH) ctx.fillRect(px + 1, py + 1, 4, ph);
+			else ctx.fillRect(px + 1, py + 1, pw, 4);
+			ctx.fillStyle = '#3b82f6';
+			if (longH) ctx.fillRect(px + pw - 3, py + 1, 4, ph);
+			else ctx.fillRect(px + 1, py + ph - 3, pw, 4);
 		} else {
-			ctx.fillRect(px + 1, py + 1, pw, 3);
-			ctx.fillRect(px + 1, py + ph - 2, pw, 3);
+			ctx.fillStyle = '#38bdf8';
+			if (longH) {
+				ctx.fillRect(px + 1, py + 1, 3, ph);
+				ctx.fillRect(px + pw - 2, py + 1, 3, ph);
+			} else {
+				ctx.fillRect(px + 1, py + 1, pw, 3);
+				ctx.fillRect(px + 1, py + ph - 2, pw, 3);
+			}
 		}
 
 		const midX = px + pw / 2, midY = py + ph / 2;
-		ctx.fillStyle = '#1e293b';
+		ctx.fillStyle = mag ? '#78350f' : '#1e293b';
 		ctx.beginPath();
 		ctx.arc(midX, midY, Math.min(pw, ph) * 0.22, 0, Math.PI * 2);
 		ctx.fill();
-		ctx.strokeStyle = '#94a3b8';
+		ctx.strokeStyle = mag ? '#fde68a' : '#94a3b8';
 		ctx.lineWidth = 1;
 		ctx.stroke();
+		if (mag) {
+			ctx.fillStyle = '#fde68a';
+			ctx.font = '10px monospace';
+			ctx.textAlign = 'center';
+			ctx.textBaseline = 'middle';
+			ctx.fillText((p.magStrength || 1) >= 0 ? '⊙' : '⊗', midX, midY);
+		}
 
 		if (Math.abs(p.vel || 0) > 0.05) {
 			ctx.strokeStyle = '#fde047';
 			ctx.lineWidth = 1.5;
 			const dirSign = Math.sign(p.vel);
 			ctx.beginPath();
-			if (isH) {
+			if (moveH) {
 				ctx.moveTo(midX - dirSign * 4, midY - 3);
 				ctx.lineTo(midX + dirSign * 4, midY);
 				ctx.lineTo(midX - dirSign * 4, midY + 3);
@@ -1010,9 +1046,60 @@ function render() {
 			}
 			ctx.stroke();
 		}
+		if (mag && Math.abs(p.lastFcoil || 0) > 0.5) {
+			ctx.strokeStyle = '#f59e0b';
+			ctx.lineWidth = 1.5;
+			const sgn = Math.sign(p.lastFcoil);
+			ctx.beginPath();
+			if (moveH) {
+				ctx.moveTo(midX - sgn * 8, midY + 6);
+				ctx.lineTo(midX + sgn * 8, midY + 6);
+			} else {
+				ctx.moveTo(midX + 6, midY - sgn * 8);
+				ctx.lineTo(midX + 6, midY + sgn * 8);
+			}
+			ctx.stroke();
+		}
 	}
 	pumps.forEach(p => drawPump(p));
 	pistons.forEach(p => drawPiston(p));
+
+	if (colorView === 'bfield' && fieldBz) {
+		let peak = 1e-6;
+		for (let i = 0; i < fieldBz.length; i++) {
+			const a = Math.abs(fieldBz[i]);
+			if (a > peak) peak = a;
+		}
+		for (let i = 0; i < fieldBz.length; i++) {
+			const t = fieldBz[i] / peak;
+			if (Math.abs(t) < 0.04) continue;
+			const x = (i % GRID_W) * CELL_SIZE, y = ((i / GRID_W) | 0) * CELL_SIZE;
+			ctx.fillStyle = t > 0 ? 'rgba(239,68,68,' + Math.min(0.55, Math.abs(t) * 0.7) + ')' : 'rgba(59,130,246,' + Math.min(0.55, Math.abs(t) * 0.7) + ')';
+			ctx.fillRect(x, y, CELL_SIZE, CELL_SIZE);
+		}
+		ctx.lineWidth = 1.5;
+		ctx.lineCap = 'round';
+		for (let ei = 0; ei < fieldEdges.length; ei++) {
+			const e = fieldEdges[ei];
+			if (Math.abs(e.I) < 0.02) continue;
+			const ax = (e.a % GRID_W) + 0.5, ay = ((e.a / GRID_W) | 0) + 0.5;
+			const bx = (e.b % GRID_W) + 0.5, by = ((e.b / GRID_W) | 0) + 0.5;
+			const sg = e.I >= 0 ? 1 : -1;
+			const x0 = (sg > 0 ? ax : bx) * CELL_SIZE, y0 = (sg > 0 ? ay : by) * CELL_SIZE;
+			const x1 = (sg > 0 ? bx : ax) * CELL_SIZE, y1 = (sg > 0 ? by : ay) * CELL_SIZE;
+			ctx.strokeStyle = '#fde047';
+			ctx.beginPath(); ctx.moveTo(x0, y0); ctx.lineTo(x1, y1); ctx.stroke();
+			const ux = x1 - x0, uy = y1 - y0, L = Math.hypot(ux, uy) || 1;
+			const hx = ux / L * 4, hy = uy / L * 4;
+			ctx.beginPath();
+			ctx.moveTo(x1, y1);
+			ctx.lineTo(x1 - hx - hy * 0.5, y1 - hy + hx * 0.5);
+			ctx.moveTo(x1, y1);
+			ctx.lineTo(x1 - hx + hy * 0.5, y1 - hy - hx * 0.5);
+			ctx.stroke();
+		}
+	}
+
 	// Predicted junction markers for the active plan (during drag or awaiting Apply).
 	function drawPlanJunctions(path, segs) {
 		if (!path || path.length < 2 || !segs || !segs.length) return;
@@ -1232,6 +1319,9 @@ const GM_ICONS = {
 	airsink: '<circle cx="12" cy="12" r="8"/><path d="M8 12h8"/>',
 	pipevalve:  '<circle cx="12" cy="12" r="7"/><path d="M12 5v14M5 12h14"/>',
 	pipeportal: '<circle cx="5" cy="12" r="3"/><circle cx="19" cy="12" r="3"/><path d="M8 12h8"/>',
+	piston:     '<rect x="4" y="8" width="16" height="8" rx="1"/><path d="M4 8v8M20 8v8"/>',
+	solenoid:   '<rect x="4" y="8" width="16" height="8" rx="1"/><circle cx="12" cy="12" r="2.5"/>',
+	pump:       '<rect x="5" y="5" width="14" height="14" rx="2"/><path d="M8 12h8M14 9l3 3-3 3"/>',
 };
 function renderGodmode() {
 	const el = document.getElementById('godmodeList');

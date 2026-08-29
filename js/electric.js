@@ -346,6 +346,38 @@ const FIELD_SWEEPS_PER_FRAME = 50; // relaxation steps advanced each frame
 let simRunning = false;            // unified sim (field + heat) loop is active
 let fieldDirty = false;            // force at least one more field frame
 let heatDirty = false;             // force at least one more heat frame
+let fieldEdges = [];               // {a,b,Re,dlx,dly,mx,my,E,I,key}
+let fieldEdgeMap = new Map();      // "a:b" -> edge
+let fieldBz = null;                // per-cell Bz overlay
+let magEnergyResidual = 0;         // Σ E·I + Σ F·v (should be ~0)
+
+function magKernelG(dlx, dly, rx, ry, sig2) {
+	const den = rx * rx + ry * ry + sig2;
+	return (dlx * ry - dly * rx) / den;
+}
+function magKernelGrad(dlx, dly, rx, ry, sig2) {
+	const num = dlx * ry - dly * rx;
+	const den = rx * rx + ry * ry + sig2;
+	const den2 = den * den;
+	return {
+		gx: (-dly * den - num * 2 * rx) / den2,
+		gy: (dlx * den - num * 2 * ry) / den2
+	};
+}
+function magnetList() {
+	const out = [];
+	for (let i = 0; i < pistons.length; i++) if (pistons[i].magnet) out.push(pistons[i]);
+	return out;
+}
+function edgeIsSelf(edge, body) {
+	const cells = bodyCells(body);
+	let ha = false, hb = false;
+	for (let i = 0; i < cells.length; i++) {
+		if (cells[i] === edge.a) ha = true;
+		if (cells[i] === edge.b) hb = true;
+	}
+	return ha && hb;
+}
 
 function fieldSimulate() {
 	// 1) Per-cell resistance grid + connected components.
@@ -379,6 +411,8 @@ function fieldSimulate() {
 			const s = switchByIdx.get(idx);
 			return s.value ? R_switch : Infinity; // open switch breaks the medium
 		}
+		const ba = caseABodyAt(idx);
+		if (ba) return (ba.R_arm != null ? ba.R_arm : 2) / 2;
 		if (metalCells[idx]) return R_metal;
 		if (wireCells.has(idx)) return R_wire;
 		return Infinity; // bare ground / air is non-conductive
@@ -431,6 +465,77 @@ function fieldSimulate() {
 	//    diffusion over animation frames. The forbidden set keeps the generic
 	//    4-neighbour coupling from also shorting the battery's poles.
 	const gOf = (u, v) => 1 / (R[u] + R[v]);
+	const sig2 = SIGMA_B * SIGMA_B;
+	const r2max = MAG_RMAX * MAG_RMAX;
+	const mags = magnetList();
+
+	// Per-edge registry (a < b, row-major) + magnet-induced EMF.
+	fieldEdges = [];
+	fieldEdgeMap = new Map();
+	for (let i = 0; i < N; i++) {
+		if (!finite(i)) continue;
+		const cx = i % GRID_W, cy = (i / GRID_W) | 0;
+		for (const [dx, dy] of [[1, 0], [0, 1]]) {
+			const nx = cx + dx, ny = cy + dy;
+			if (nx >= GRID_W || ny >= GRID_H) continue;
+			const m = ny * GRID_W + nx;
+			if (!finite(m) || isForbidden(i, m)) continue;
+			const a = i, b = m;
+			const Re = R[a] + R[b];
+			const dlx = dx, dly = dy;
+			const mx = (cx + nx) * 0.5 + 0.5;
+			const my = (cy + ny) * 0.5 + 0.5;
+			let E = 0;
+			for (let mi = 0; mi < mags.length; mi++) {
+				const mag = mags[mi];
+				const edgeTmp = { a, b };
+				if (edgeIsSelf(edgeTmp, mag)) continue;
+				const c = bodyCenter(mag);
+				const rx = c.x - mx, ry = c.y - my;
+				if (rx * rx + ry * ry > r2max) continue;
+				const hat = bodyHat(mag);
+				const gxy = magKernelGrad(dlx, dly, rx, ry, sig2);
+				const dgda = gxy.gx * hat.ax + gxy.gy * hat.ay;
+				E += -(mag.magStrength || 1) * K_B * dgda * (mag.vel || 0);
+			}
+			const edge = { a, b, Re, dlx, dly, mx, my, E, I: 0, key: a + ':' + b };
+			fieldEdges.push(edge);
+			fieldEdgeMap.set(edge.key, edge);
+		}
+	}
+
+	function injectEMF(inj, root) {
+		for (let ei = 0; ei < fieldEdges.length; ei++) {
+			const e = fieldEdges[ei];
+			if (!e.E) continue;
+			if (netFind(e.a) !== root || netFind(e.b) !== root) continue;
+			const In = e.E / e.Re;
+			inj.set(e.b, (inj.get(e.b) || 0) + In);
+			inj.set(e.a, (inj.get(e.a) || 0) - In);
+		}
+	}
+	function buildComp(root) {
+		const comp = [];
+		const compRed = [], compBlack = [];
+		for (let i = 0; i < N; i++) if (netFind(i) === root) {
+			comp.push(i);
+			const cx = i % GRID_W, cy = (i / GRID_W) | 0;
+			(cx + cy & 1 ? compBlack : compRed).push(i);
+		}
+		const Ga = new Map();
+		for (const n of comp) {
+			const cx = n % GRID_W, cy = (n / GRID_W) | 0, list = [];
+			for (let d = 0; d < 4; d++) {
+				const nx = cx + dirs[d].dx, ny = cy + dirs[d].dy;
+				if (nx < 0 || nx >= GRID_W || ny < 0 || ny >= GRID_H) continue;
+				const m = ny * GRID_W + nx;
+				if (netFind(m) === root && !isForbidden(n, m) && finite(m)) list.push([m, gOf(n, m)]);
+			}
+			Ga.set(n, list);
+		}
+		return { comp, compRed, compBlack, Ga };
+	}
+
 	const seen = new Set();
 	fieldSystems = [];
 	manualBatteries.forEach(b => {
@@ -459,24 +564,7 @@ function fieldSimulate() {
 			return netFind(pp) === root;
 		});
 
-		const comp = [];
-		const compRed = [], compBlack = [];
-		for (let i = 0; i < N; i++) if (netFind(i) === root) {
-			comp.push(i);
-			const cx = i % GRID_W, cy = (i / GRID_W) | 0;
-			(cx + cy & 1 ? compBlack : compRed).push(i);
-		}
-		const Ga = new Map();
-		for (const n of comp) {
-			const cx = n % GRID_W, cy = (n / GRID_W) | 0, list = [];
-			for (let d = 0; d < 4; d++) {
-				const nx = cx + dirs[d].dx, ny = cy + dirs[d].dy;
-				if (nx < 0 || nx >= GRID_W || ny < 0 || ny >= GRID_H) continue;
-				const m = ny * GRID_W + nx;
-				if (netFind(m) === root && !isForbidden(n, m)) list.push([m, gOf(n, m)]);
-			}
-			Ga.set(n, list);
-		}
+		const { comp, compRed, compBlack, Ga } = buildComp(root);
 		// Norton injections + internal conductance for every battery.
 		const inj = new Map();
 		comp.forEach(n => inj.set(n, 0));
@@ -490,8 +578,47 @@ function fieldSimulate() {
 			inj.set(bq, inj.get(bq) - I_n);
 			if (i === 0) groundQ = bq;             // single ground per component
 		});
+		injectEMF(inj, root);
 		fieldSystems.push({ root, comp, compRed, compBlack, Ga, inj, groundQ, fixed: new Set([groundQ]), compBatts, lastDv: Infinity });
 	});
+
+	// Magnet-only loops: a connected conductor component with a cycle (or a
+	// moving magnet inducing EMF on a loop) and no battery still carries current.
+	if (mags.length) {
+		const edgeCount = new Map();
+		const nodeCount = new Map();
+		for (let i = 0; i < N; i++) {
+			if (!finite(i)) continue;
+			const r = netFind(i);
+			nodeCount.set(r, (nodeCount.get(r) || 0) + 1);
+		}
+		for (let ei = 0; ei < fieldEdges.length; ei++) {
+			const e = fieldEdges[ei];
+			const r = netFind(e.a);
+			if (netFind(e.b) !== r) continue;
+			edgeCount.set(r, (edgeCount.get(r) || 0) + 1);
+		}
+		const magRoots = new Set();
+		for (let ei = 0; ei < fieldEdges.length; ei++) {
+			if (!fieldEdges[ei].E) continue;
+			magRoots.add(netFind(fieldEdges[ei].a));
+		}
+		nodeCount.forEach((nN, root) => {
+			if (seen.has(root)) return;
+			const nE = edgeCount.get(root) || 0;
+			const hasCycle = nE > nN - 1;
+			if (!hasCycle) return;
+			if (!magRoots.has(root)) return;
+			seen.add(root);
+			const { comp, compRed, compBlack, Ga } = buildComp(root);
+			if (!comp.length) return;
+			const inj = new Map();
+			comp.forEach(n => inj.set(n, 0));
+			injectEMF(inj, root);
+			const groundQ = comp[0];
+			fieldSystems.push({ root, comp, compRed, compBlack, Ga, inj, groundQ, fixed: new Set([groundQ]), compBatts: [], lastDv: Infinity });
+		});
+	}
 
 	// 3) Ensure the persistent field exists. No Dirichlet pinning — the EMF is
 	//    injected every sweep (see fieldRelax) so the series voltage EMERGES
@@ -557,7 +684,7 @@ function fieldPublish() {
 	});
 
 	for (const s of fieldSystems) {
-		const compBatts = s.compBatts;
+		const compBatts = s.compBatts || [];
 		const nBatt = compBatts.length;
 		const Vbat_total = nBatt * Vbat;
 		// Total delivered current (Norton: I_n minus the part recirculating
@@ -581,8 +708,12 @@ function fieldPublish() {
 			voltages.set(n, vn);
 			cellColor.set(n, voltageColor(vn, vmin, vmax));
 			energized.add(n);
-			resPos.set(n, ((Vbat_total - vn) / Vbat_total) * Req);
-			resNeg.set(n, (vn / Vbat_total) * Req);
+			if (nBatt > 0 && isFinite(Req)) {
+				resPos.set(n, ((Vbat_total - vn) / Vbat_total) * Req);
+				resNeg.set(n, (vn / Vbat_total) * Req);
+			} else {
+				resPos.set(n, 0); resNeg.set(n, 0);
+			}
 		}
 		// Lamp voltage drop = difference between its two conductor neighbours.
 		lamps.forEach(l => {
@@ -601,8 +732,74 @@ function fieldPublish() {
 			else p.dV = Math.abs(fieldV[list[0][0]] - fieldV[p.idx]);
 			p.lastPower = (p.dV * p.dV) / (p.R || 10.0);
 		});
-		if (!hasLoad) for (const n of s.comp) shorts.add(n);
+		if (!hasLoad && nBatt > 0) for (const n of s.comp) shorts.add(n);
 	}
+
+	// Per-edge current, Bz overlay, magnet force / EMF readouts, energy identity.
+	const Ngrid = GRID_W * GRID_H;
+	if (!fieldBz || fieldBz.length !== Ngrid) fieldBz = new Float64Array(Ngrid);
+	else fieldBz.fill(0);
+	const sig2 = SIGMA_B * SIGMA_B;
+	const r2max = MAG_RMAX * MAG_RMAX;
+	const live = new Set();
+	for (const s of fieldSystems) for (let i = 0; i < s.comp.length; i++) live.add(s.comp[i]);
+	for (let ei = 0; ei < fieldEdges.length; ei++) {
+		const e = fieldEdges[ei];
+		if (!live.has(e.a) || !live.has(e.b)) { e.I = 0; continue; }
+		const Va = fieldV[e.a] || 0, Vb = fieldV[e.b] || 0;
+		e.I = (Va - Vb + (e.E || 0)) / e.Re;
+	}
+	const mags = magnetList();
+	for (let mi = 0; mi < mags.length; mi++) {
+		const mag = mags[mi];
+		const m = mag.magStrength != null ? mag.magStrength : 1;
+		const c = bodyCenter(mag);
+		const hat = bodyHat(mag);
+		let Bz = 0, dBx = 0, dBy = 0, elecP = 0, maxI = 0, bridgeI = 0;
+		for (let ei = 0; ei < fieldEdges.length; ei++) {
+			const e = fieldEdges[ei];
+			if (edgeIsSelf(e, mag)) {
+				bridgeI = e.I;
+				continue;
+			}
+			const rx = c.x - e.mx, ry = c.y - e.my;
+			if (rx * rx + ry * ry > r2max) continue;
+			const g = magKernelG(e.dlx, e.dly, rx, ry, sig2);
+			const gr = magKernelGrad(e.dlx, e.dly, rx, ry, sig2);
+			Bz += K_B * e.I * g;
+			dBx += K_B * e.I * gr.gx;
+			dBy += K_B * e.I * gr.gy;
+			// E_e,b for this magnet (same kernel as force)
+			const dgda = gr.gx * hat.ax + gr.gy * hat.ay;
+			const Eb = -m * K_B * dgda * (mag.vel || 0);
+			elecP += Eb * e.I;
+			if (Math.abs(e.I) > Math.abs(maxI)) maxI = e.I;
+		}
+		const F = m * (dBx * hat.ax + dBy * hat.ay);
+		mag.lastBz = Bz;
+		mag.lastFcoil = F;
+		mag.lastPower = elecP;
+		mag.lastCurrent = isCaseA(mag) ? bridgeI : maxI;
+		mag.lastEMF = mag.lastCurrent ? elecP / mag.lastCurrent : 0;
+		const eta = mag.efficiency != null ? mag.efficiency : 0.85;
+		mag.lastHeat = Math.abs(elecP) * Math.max(0, 1 - eta);
+	}
+	for (let i = 0; i < Ngrid; i++) {
+		const cx = (i % GRID_W) + 0.5, cy = ((i / GRID_W) | 0) + 0.5;
+		let Bz = 0;
+		for (let ei = 0; ei < fieldEdges.length; ei++) {
+			const e = fieldEdges[ei];
+			const rx = cx - e.mx, ry = cy - e.my;
+			if (rx * rx + ry * ry > r2max) continue;
+			Bz += K_B * e.I * magKernelG(e.dlx, e.dly, rx, ry, sig2);
+		}
+		fieldBz[i] = Bz;
+	}
+	let residual = 0;
+	for (let ei = 0; ei < fieldEdges.length; ei++) residual += fieldEdges[ei].E * fieldEdges[ei].I;
+	for (let mi = 0; mi < mags.length; mi++) residual += (mags[mi].lastFcoil || 0) * (mags[mi].vel || 0);
+	magEnergyResidual = residual;
+
 	// The electric field is live, so heat tracks it every frame. Build the
 	// shared per-cell R grid + Joule heat sources now; the unified tick's
 	// heatRelax consumes them. (No render() here — simTick renders once.)
@@ -640,6 +837,7 @@ function computeHeatSource() {
 		else if (lampByIdx.has(i)) { const l = lampByIdx.get(i); r = l.limited ? l.R : R_wire; }
 		else if (pumpByIdx.has(i)) { const p = pumpByIdx.get(i); r = p.limited ? p.R : R_wire; }
 		else if (switchOn.has(i)) r = R_switch;
+		else if (caseABodyAt(i)) { const ba = caseABodyAt(i); r = (ba.R_arm != null ? ba.R_arm : 2) / 2; }
 		else if (metalCells[i]) r = R_metal;
 		else if (wireCells.has(i)) r = R_wire;
 		else r = Infinity;
@@ -655,7 +853,8 @@ function computeHeatSource() {
 			if (!isFinite(heatR[m]) || !voltages.has(m)) continue;
 			const ek = Math.min(i, m) + ':' + Math.max(i, m);
 			if (forbidden.has(ek)) continue;                 // skip the battery's own pole-to-pole edge
-			const dV = voltages.get(i) - voltages.get(m);
+			const emf = (fieldEdgeMap.get(ek) && fieldEdgeMap.get(ek).E) || 0;
+			const dV = voltages.get(i) - voltages.get(m) + emf;
 			const Re = heatR[i] + heatR[m];
 			const P = (dV * dV) / Re;                          // = I²·Re, full edge Joule power
 			heatSource[i] += P * heatR[i] / Re;               // resistance-weighted attribution
@@ -667,6 +866,12 @@ function computeHeatSource() {
 	// Scaled by HEAT_GAIN so a default lamp reaches a watchable ~5 K/s gradient.
 	for (const l of lamps) if (!l.limited) heatSource[l.idx] += (l.lumen / LM_EFFICACY) * HEAT_GAIN;
 	for (const p of pumps) if (p.lastHeat) heatSource[p.idx] += p.lastHeat;
+	for (const b of pistons) {
+		if (!b.lastHeat) continue;
+		const cells = bodyCells(b);
+		const share = b.lastHeat / Math.max(1, cells.length);
+		for (let i = 0; i < cells.length; i++) heatSource[cells[i]] += share;
+	}
 }
 
 // ---- Air pressure engine -------------------------------------------------
@@ -678,8 +883,8 @@ function computeHeatSource() {
 function electricActive() {
 	// Battery-only (NOT gated on wires/loads): a lone battery still has a valid
 	// 2-pole field, and gating on a network would also skip fieldPublish and
-	// starve heatSource. The Circuit engine stops its own loop via simulate().
-	return activeEngine === 'field' && manualBatteries.length > 0;
+	// starve heatSource. Magnets keep the loop alive so EMF/force update.
+	return activeEngine === 'field' && (manualBatteries.length > 0 || magnetList().length > 0);
 }
 
 // Unified animation loop: relax the electric field (Field engine) and the air
@@ -694,6 +899,7 @@ function simTick(now) {
 	lastSimT = now;
 	const dt = (realDt * TIME_SCALE) / HEAT_SWEEPS_PER_FRAME;  // s per air sub-step
 	if (electricActive()) {
+		if (magnetList().length) fieldSimulate(); // rebuild edges/EMF/Case-A cells
 		fieldRelax(FIELD_SWEEPS_PER_FRAME);
 		fieldPublish();   // also refreshes heatSource every frame
 	} else if (heatAirActive()) {

@@ -170,6 +170,7 @@
 				<button type="button" class="otype-btn" data-scene="electric-combo" title="Combined circuit: 2 batteries in series → 2 switches in series → 1 lamp → 2 parallel lamps, each with its own switch. Toggle switches; watch series voltage (~2·Vbat) emerge and parallel branches act independently.">Electricity</button>
 				<button type="button" class="otype-btn" data-scene="tunnel-air" title="20×1 sealed air tunnel: Air Source (3,15) → Air Sink (17,15). Watch the PV=nRT pressure gradient in the Air/Pressure views.">Air Tunnel</button>
 				<button type="button" class="otype-btn" data-scene="piston-pump" title="Sealed chamber with Air Pump and 2×1 Piston: Pump builds pressure that pushes the piston against friction.">Piston &amp; Pump</button>
+				<button type="button" class="otype-btn" data-scene="solenoid-lab" title="Gas moves a magnet piston (generator) whose induced current drives a second magnet (motor).">Solenoid Lab</button>
 				</div>
 			</div>
 			<div id="advanced">
@@ -186,6 +187,10 @@
 			<label class="ctrl">Metal R:
 				<input type="range" id="metalR" min="1" max="200" step="1" value="20">
 				<span id="metalRVal">20</span> Ω
+			</label>
+			<label class="ctrl">K<sub>B</sub> (mag):
+				<input type="range" id="kbGain" min="1" max="200" step="1" value="40">
+				<span id="kbGainVal">40</span>
 			</label>
 			<label class="ctrl">Battery R:
 				<input type="range" id="batR" min="0.1" max="5" step="0.1" value="0.5">
@@ -217,6 +222,7 @@
 				<button type="button" class="tool-btn" id="btnViewVoltage" title="Voltage heatmap (blue 0V → red Vbat) with per-node V, per-lamp ΔV and per-node R→+/R→−">Voltages</button>
 				<button type="button" class="tool-btn" id="btnViewHeat" title="Temperature from Joule (I²R) heating, diffusing through all cells. Blue = cool, red = hot; a legend shows the auto-scaled peak. Higher lamp resistance ⇒ more heat.">Heat</button>
 				<button type="button" class="tool-btn" id="btnViewPressure" title="Pressure (PV=nRT) view: pressure map + particles + flow-direction arrows">Pressure</button>
+				<button type="button" class="tool-btn" id="btnViewBField" title="Magnetic field Bz (red out / blue in) and edge current arrows">B-field</button>
 			</div>
 			</div><br>
 			<canvas id="ctx"></canvas>
@@ -313,7 +319,19 @@
 			<div class="prop-row"><span>ΔP (Drive)</span><span data-bind="deltaP"></span></div>
 			<div class="prop-row"><span>F_press</span><span data-bind="fPress"></span></div>
 			<div class="prop-row"><span>F_fric</span><span data-bind="fFric"></span></div>
+			<div class="prop-row"><span>F_coil</span><span data-bind="fCoil"></span></div>
 			<div class="prop-row"><span>Status</span><span data-bind="status"></span></div>
+			<div data-show="magnet">
+				<div class="prop-sub">Magnet</div>
+				<label class="ctrl"><span>m (dipole)</span><span class="ctrl-val" data-bind="magHead"></span><input type="range" data-input="magStrength" min="-5" max="5" step="0.1" value="1"></label>
+				<label class="ctrl"><span>R_arm (Ω)</span><span class="ctrl-val" data-bind="rArmHead"></span><input type="range" data-input="R_arm" min="0.2" max="20" step="0.1" value="2"></label>
+				<label class="ctrl"><span>Efficiency (%)</span><span class="ctrl-val" data-bind="etaHead"></span><input type="range" data-input="efficiency" min="0" max="100" step="1" value="85"></label>
+				<div class="prop-row"><span>Bz</span><span data-bind="bz"></span></div>
+				<div class="prop-row"><span>EMF</span><span data-bind="emf"></span></div>
+				<div class="prop-row"><span>Current</span><span data-bind="current"></span></div>
+				<div class="prop-row"><span>Power</span><span data-bind="magPower"></span></div>
+				<div class="prop-row"><span>Waste heat</span><span data-bind="magHeat"></span></div>
+			</div>
 			<button data-return>Return to inventory</button>
 		</template>
 		<template id="prop-tpl-pump">
@@ -351,6 +369,34 @@
 				<div class="card-head" data-target="path-card">
 					<span class="fold">&#x25be;</span><span class="ht">Path List</span>
 					<button id="copyPathsBtn" title="Copy nodes &amp; links" style="cursor: pointer; font-size: 13px; line-height: 1; padding: 2px 6px; background: #333; color: #eee; border: 1px solid #555; border-radius: 4px;">&#x2219;&#x2219;</button>
+				</div>
+				<div id="path-list"></div>
+			</div>
+			<div class="card" id="inv-card">
+				<div class="card-head" data-target="inv-card">
+					<span class="fold">&#x25be;</span><span class="ht">Inventory</span>
+				</div>
+				<div id="inv-list"></div>
+			</div>
+			<div class="card" id="log-card">
+				<div class="card-head" data-target="log-card">
+					<span class="fold">&#x25be;</span><span class="ht">System Log</span>
+				</div>
+				<div id="log"></div>
+			</div>
+		</div>
+	</div>
+
+	<script src="js/state.js"></script>
+	<script src="js/maze.js"></script>
+	<script src="js/network.js"></script>
+	<script src="js/render.js"></script>
+	<script src="js/electric.js"></script>
+	<script src="js/air.js"></script>
+	<script src="js/ui.js"></script>
+</body>
+</html>
+n" title="Copy nodes &amp; links" style="cursor: pointer; font-size: 13px; line-height: 1; padding: 2px 6px; background: #333; color: #eee; border: 1px solid #555; border-radius: 4px;">&#x2219;&#x2219;</button>
 				</div>
 				<div id="path-list"></div>
 			</div>

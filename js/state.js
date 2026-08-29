@@ -81,6 +81,7 @@ const GOD_ITEMS = [
   { id: 'pipevalve',  label: 'Pipe Valve',  tool: 'pipevalve'  },
   { id: 'pipeportal', label: 'Pipe Portal', tool: 'pipeportal' },
   { id: 'piston',     label: 'Piston (2x1)',tool: 'piston'     },
+  { id: 'solenoid',   label: 'Magnet Piston',tool: 'solenoid'  },
   { id: 'pump',       label: 'Air Pump',    tool: 'pump'       },
   { id: 'metal',  label: 'Metal/Ground',tool: 'metal' },
 ];
@@ -102,6 +103,7 @@ const INV = {
 	pipevalve:  { type: 'pipevalve',  count: 1, label: 'Pipe Valve'  },
 	pipeportal: { type: 'pipeportal', count: 1, label: 'Pipe Portal' },
 	piston:     { type: 'piston',     count: 1, label: 'Piston' },
+	solenoid:   { type: 'solenoid',   count: 1, label: 'Magnet Piston' },
 	pump:       { type: 'pump',       count: 1, label: 'Air Pump' },
 };
 // Single colorless segment pool (no red/blue split). Map len(>=1) -> count available.
@@ -142,6 +144,73 @@ const pipePortals = [];              // placed pipe portals: { a, b, limited, op
 const pistons = [];                  // placed pistons: { id, x, y, axis, pos, vel, friction, damping, mass, limited, lastFpress, lastFfric, blockedWall }
 const pumps = [];                    // placed pumps: { x, y, idx, dir, R, efficiency, limited, dV, lastPower, lastFlow, lastDeltaP, lastEff, lastHeat }
 let pistonIdSeq = 0;
+
+const bodies = pistons; // alias; pistons remains the array of record
+let K_B = 40;           // magnetic kernel gain (slider)
+const SIGMA_B = 0.5;    // soft-core radius (cells)
+const MAG_RMAX = 8;     // kernel cutoff (cells)
+
+function bodyMoveAxis(b) { return b.moveAxis || b.axis; }
+function isCaseA(b) { return !!b.magnet && b.axis && bodyMoveAxis(b) !== b.axis; }
+function bodySpan(b) { return (b.axis && bodyMoveAxis(b) === b.axis) ? 2 : (isCaseA(b) ? 1 : 2); }
+function bodyHat(b) { return bodyMoveAxis(b) === 'h' ? { ax: 1, ay: 0 } : { ax: 0, ay: 1 }; }
+function bodyRect(b) {
+	const ma = bodyMoveAxis(b);
+	const span = bodySpan(b);
+	const pos = b.pos != null ? b.pos : (ma === 'h' ? b.x : b.y);
+	if (ma === 'h') {
+		const y0 = b.y, y1 = b.y + (b.axis === 'v' ? 2 : 1);
+		return { x0: pos, x1: pos + span, y0, y1 };
+	}
+	const x0 = b.x, x1 = b.x + (b.axis === 'h' ? 2 : 1);
+	return { x0, x1, y0: pos, y1: pos + span };
+}
+function bodyCenter(b) {
+	const r = bodyRect(b);
+	return { x: (r.x0 + r.x1) * 0.5, y: (r.y0 + r.y1) * 0.5 };
+}
+function bodyCells(b) {
+	const r = bodyRect(b);
+	const cells = [];
+	const x0 = Math.max(0, Math.floor(r.x0 + 1e-9));
+	const x1 = Math.min(GRID_W - 1, Math.ceil(r.x1 - 1e-9) - 1);
+	const y0 = Math.max(0, Math.floor(r.y0 + 1e-9));
+	const y1 = Math.min(GRID_H - 1, Math.ceil(r.y1 - 1e-9) - 1);
+	for (let y = y0; y <= y1; y++) for (let x = x0; x <= x1; x++) cells.push(y * GRID_W + x);
+	return cells;
+}
+function caseABodyAt(idx) {
+	for (let i = 0; i < pistons.length; i++) {
+		const p = pistons[i];
+		if (!isCaseA(p)) continue;
+		if (bodyCells(p).includes(idx)) return p;
+	}
+	return null;
+}
+function createMechanicalBody(spec) {
+	const axis = spec.axis || 'h';
+	const moveAxis = spec.moveAxis || axis;
+	const x = spec.x || 0, y = spec.y || 0;
+	const pos = spec.pos != null ? spec.pos : (moveAxis === 'h' ? x : y);
+	return {
+		id: ++pistonIdSeq,
+		kind: spec.kind || (spec.magnet ? 'solenoid' : 'piston'),
+		x, y, axis, moveAxis, pos,
+		vel: spec.vel || 0,
+		friction: spec.friction != null ? spec.friction : 50,
+		damping: spec.damping != null ? spec.damping : 200,
+		mass: spec.mass != null ? spec.mass : 100,
+		limited: spec.limited != null ? spec.limited : true,
+		magnet: !!spec.magnet,
+		magStrength: spec.magStrength != null ? spec.magStrength : 1,
+		R_arm: spec.R_arm != null ? spec.R_arm : 2,
+		efficiency: spec.efficiency != null ? spec.efficiency : 0.85,
+		lastFpress: 0, lastFfric: 0, lastFcoil: 0,
+		lastBz: 0, lastEMF: 0, lastCurrent: 0, lastPower: 0, lastHeat: 0,
+		blockedWall: false
+	};
+}
+
 const PUMP_DIRS = [
 	{ dx: 0,  dy: -1, arrow: '↑', label: 'North (Up)' },
 	{ dx: 1,  dy: 0,  arrow: '→', label: 'East (Right)' },
@@ -211,9 +280,11 @@ const heatR = new Float64Array(HEAT_N);      // per-cell heat resistance (set by
 // is the air mass (kg). Pressure P = n·R·T_abs (Pa).
 const T_AMB = 293;                       // ambient absolute T (K, ~20C)
 const AIR_RHO = 1.2;                     // kg/m^3 (air at ~20C, 1 atm)
-const AIR_CP = 1005;                     // J/(kg·K)               (specific heat)
+const AIR_CP = 1005;                     // J/(kg·K)               (specific heat at const P)
+const AIR_CV = AIR_CP - 287;             // J/(kg·K) ≈ 718; T↔U uses cv (R_SPEC declared below)
+const AIR_GAMMA = AIR_CP / AIR_CV;       // ≈ 1.40
 const CELL_VOL = 1;                      // m^3 (1m × 1m × 1m tunnel)
-const C_AIR_REAL = AIR_RHO * AIR_CP * CELL_VOL; // J/K per cell ≈ 1206
+const C_AIR_REAL = AIR_RHO * AIR_CP * CELL_VOL; // J/K per cell ≈ 1206 (legacy; conduction uses n·cv)
 const AIR_K = 0.026;                     // W/(m·K) molecular thermal conductivity
 const G_COND = 200;                      // W/K effective per face (conduction). High enough that heat
                                          // actually spreads across the maze on a watchable timescale
@@ -269,11 +340,7 @@ function cellOccupied(idx) {
 		|| pipeValves.some(v => v.idx === idx)
 		|| pipePortals.some(p => p.a === idx || p.b === idx)
 		|| pumps.some(p => p.idx === idx)
-		|| pistons.some(p => {
-			const x0 = Math.round(p.pos), y0 = p.y;
-			if (p.axis === 'h') return (y0 * GRID_W + x0 === idx) || (y0 * GRID_W + x0 + 1 === idx);
-			else return (p.x + y0 * GRID_W === idx) || (p.x + (y0 + 1) * GRID_W === idx);
-		})
+	|| pistons.some(p => bodyCells(p).includes(idx))
 		|| manualWires.some(w => w.cells.includes(idx))
 		|| manualBatteries.some(b => b.poles.includes(idx));
 }
@@ -355,6 +422,7 @@ function updateStatus(x, y) {
 		: activeTool === 'pipevalve' ? 'Place Pipe Valve' + (unlimited ? ' (∞)' : ' ×' + INV.pipevalve.count)
 		: activeTool === 'pipeportal' ? 'Place Pipe Portal' + (unlimited ? ' (∞)' : ' ×' + INV.pipeportal.count)
 		: activeTool === 'piston' ? 'Place Piston (2x1)' + (unlimited ? ' (∞)' : ' ×' + INV.piston.count)
+		: activeTool === 'solenoid' ? 'Place Magnet Piston' + (unlimited ? ' (∞)' : ' ×' + INV.solenoid.count)
 		: activeTool === 'pump' ? 'Place Air Pump' + (unlimited ? ' (∞)' : ' ×' + INV.pump.count)
 		: activeTool === 'node' ? 'Place Node (' + selectedColor + ')'
 		: activeTool === 'eraser' ? 'Eraser'
@@ -383,7 +451,8 @@ function updateStatus(x, y) {
 		}
 	}
   const engineName = activeEngine === 'field' ? 'Field' : 'Circuit (obsolete)';
-  statusBar.textContent = `Tool: ${tn}   |   Cell: ${ci}   |   Type: ${ti}${extra}   |   Net: ${selectedColor}   |   View: ${colorView === 'net' ? 'Net' : colorView === 'electric' ? 'Electric' : colorView === 'voltage' ? 'Voltage' : colorView === 'heat' ? 'Heat' : colorView === 'pressure' ? 'Pressure' : 'Light'}   |   Engine: ${engineName}   |   T: ${tStr}   |   P: ${pStr}`;
+  const viewName = colorView === 'net' ? 'Net' : colorView === 'electric' ? 'Electric' : colorView === 'voltage' ? 'Voltage' : colorView === 'heat' ? 'Heat' : colorView === 'pressure' ? 'Pressure' : colorView === 'bfield' ? 'B-field' : 'Light';
+  statusBar.textContent = `Tool: ${tn}   |   Cell: ${ci}   |   Type: ${ti}${extra}   |   Net: ${selectedColor}   |   View: ${viewName}   |   Engine: ${engineName}   |   T: ${tStr}   |   P: ${pStr}`;
 }
 
 const dirs = [{dx:0,dy:-1}, {dx:1,dy:0}, {dx:0,dy:1}, {dx:-1,dy:0}];

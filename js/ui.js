@@ -20,6 +20,8 @@ function setColorView(v) {
 	document.getElementById('btnViewVoltage').classList.toggle('active', v === 'voltage');
 	document.getElementById('btnViewHeat').classList.toggle('active', v === 'heat');
 	document.getElementById('btnViewPressure').classList.toggle('active', v === 'pressure');
+	const bf = document.getElementById('btnViewBField');
+	if (bf) bf.classList.toggle('active', v === 'bfield');
 	render();
 	updateStatus();
 }
@@ -84,7 +86,7 @@ document.getElementById('clearBtn').onclick = () => {
 	airSinks.length = 0; INV.airsink.count = 1;
 	pipeValves.length = 0; INV.pipevalve.count = 1;
 	pipePortals.length = 0; INV.pipeportal.count = 1;
-	pistons.length = 0; INV.piston.count = 1;
+	pistons.length = 0; INV.piston.count = 1; INV.solenoid.count = 1;
 	pumps.length = 0; INV.pump.count = 1;
 	pendingPortal = null;
 	syncCellOpen();
@@ -136,7 +138,7 @@ document.getElementById('clearBtn').onclick = () => {
 		INV.battery.count = 1; INV.lamp.count = 2; INV.switch.count = 2; seedWires();
 		INV.airsrc.count = 1; INV.airsink.count = 1;
 		INV.pipevalve.count = 1; INV.pipeportal.count = 1;
-		INV.piston.count = 1; INV.pump.count = 1;
+		INV.piston.count = 1; INV.solenoid.count = 1; INV.pump.count = 1;
 		pendingPlan = null; wireDrag = null; selectedManualWireLen = null; selectedItem = null;
 		unlimited = false;
 		grid.fill(0);
@@ -236,6 +238,50 @@ document.getElementById('clearBtn').onclick = () => {
 			if (pmp) pmp.dir = 1;
 			placePiston(8, 15);
 			logger('Scene: Piston & Pump — electric pump builds pressure behind the 2×1 piston, sliding it eastward.', 'sys');
+		} else if (name === 'solenoid-lab') {
+			// Gas → electricity → gas: Case B generator on the left, Case A motor on the right,
+			// sharing one wire loop. Rails sit on opposite sides of each magnet (no 4-connect short).
+			INV.battery.count = 2; INV.switch.count = 2; INV.lamp.count = 2;
+			INV.solenoid.count = 4; INV.piston.count = 2; INV.airsrc.count = 2;
+			INV.pipevalve.count = 2;
+			grid.fill(1);
+			const rc = (x, y) => y * GRID_W + x;
+			// Generator tube (Case B): row 11, x=2..14, walls above/below painted metal
+			for (let x = 2; x <= 14; x++) grid[11 * GRID_W + x] = 0;
+			for (let x = 4; x <= 12; x++) { metalCells[10 * GRID_W + x] = 1; metalCells[12 * GRID_W + x] = 1; }
+			// Motor shaft (Case A): 2-wide vertical corridor x=21..22, metal rails on x=20 and x=23
+			for (let y = 6; y <= 18; y++) { grid[y * GRID_W + 21] = 0; grid[y * GRID_W + 22] = 0; }
+			for (let y = 8; y <= 16; y++) { metalCells[y * GRID_W + 20] = 1; metalCells[y * GRID_W + 23] = 1; }
+			// Wire corridors linking the two metal U's
+			for (let x = 12; x <= 21; x++) grid[8 * GRID_W + x] = 0;
+			for (let x = 12; x <= 21; x++) grid[16 * GRID_W + x] = 0;
+			grid[10 * GRID_W + 12] = 0; grid[12 * GRID_W + 12] = 0;
+			grid[8 * GRID_W + 21] = 0; grid[16 * GRID_W + 21] = 0;
+			grid[8 * GRID_W + 23] = 0; grid[16 * GRID_W + 23] = 0;
+			// Battery + switch + lamp on the top link
+			grid[7 * GRID_W + 16] = 0; grid[8 * GRID_W + 16] = 0; grid[9 * GRID_W + 16] = 0;
+			buildNetworks();
+			seedAir();
+			// Close the loop through metal: paint connecting metal at the U ends
+			metalCells[10 * GRID_W + 4] = 1; metalCells[11 * GRID_W + 4] = 1; metalCells[12 * GRID_W + 4] = 1;
+			metalCells[rc(12, 10)] = 1; metalCells[rc(12, 8)] = 1;
+			metalCells[rc(12, 12)] = 1; metalCells[rc(12, 16)] = 1;
+			for (let x = 12; x <= 21; x++) { metalCells[rc(x, 8)] = 1; metalCells[rc(x, 16)] = 1; }
+			metalCells[rc(20, 8)] = 1; metalCells[rc(23, 8)] = 1;
+			metalCells[rc(20, 16)] = 1; metalCells[rc(23, 16)] = 1;
+			placeBattery(16, 7);
+			placeSwitch(16, 9);
+			if (switches[0]) switches[0].value = true;
+			placeLamp(18, 8);
+			placeAirSource(3, 11);
+			if (airSources[0]) airSources[0].rate = 0.4;
+			placePipeValve(4, 11);
+			if (pipeValves[0]) pipeValves[0].open = 1;
+			placeSolenoid(6, 11); // Case B in the generator tube
+			if (pistons[0]) { pistons[0].friction = 20; }
+			placeSolenoid(22, 12); // Case A in the motor shaft if conductors on both sides
+			if (pistons[1]) { pistons[1].friction = 20; }
+			logger('Scene: Solenoid Lab — gas drives the left magnet (generator); current in the loop pushes the right magnet (motor).', 'sys');
 		}
 		// Stray junction nodes left on lamp/switch/battery-pole cells would
 		// overlap their own glyphs; drop them so they draw cleanly.
@@ -289,6 +335,13 @@ const metalRSlider = document.getElementById('metalR');
   	R_metal = +metalRSlider.value;
   	if (metalRVal) metalRVal.textContent = metalRSlider.value;
   	if (anyMetal()) scheduleFieldRecompute();
+  };
+  const kbSlider = document.getElementById('kbGain');
+  const kbVal = document.getElementById('kbGainVal');
+  if (kbSlider) kbSlider.oninput = () => {
+  	K_B = +kbSlider.value;
+  	if (kbVal) kbVal.textContent = kbSlider.value;
+  	if (magnetList().length) { fieldSimulate(); startSimLoop(); }
   };
   const batRSlider = document.getElementById('batR');
   const batRVal = document.getElementById('batRVal');
@@ -1140,12 +1193,8 @@ function returnPump(p) {
 function placePiston(x, y) {
 	if (x < 0 || x >= GRID_W || y < 0 || y >= GRID_H) return;
 	const idx = y * GRID_W + x;
-	const existing = pistons.find(p => {
-		const x0 = Math.round(p.pos), y0 = p.y;
-		if (p.axis === 'h') return (x0 === x || x0 + 1 === x) && y0 === y;
-		else return p.x === x && (y0 === y || y0 + 1 === y);
-	});
-	if (existing) { selectedItem = { kind: 'piston', ref: existing }; renderProperties(); return; }
+	const existing = pistons.find(p => bodyCells(p).includes(idx));
+	if (existing) { selectedItem = { kind: existing.magnet ? 'solenoid' : 'piston', ref: existing }; renderProperties(); return; }
 	if (!unlimited && INV.piston.count <= 0) { logger('No piston left', 'err'); return; }
 
 	let axis = null;
@@ -1162,20 +1211,10 @@ function placePiston(x, y) {
 	else { logger('Piston needs a 2x1 corridor space', 'err'); return; }
 
 	if (!unlimited) INV.piston.count--;
-	const p = {
-		id: ++pistonIdSeq,
-		x, y,
-		axis,
-		pos: axis === 'h' ? x : y,
-		vel: 0,
-		friction: 50,
-		damping: 200,
-		mass: 100,
-		limited: !unlimited,
-		lastFpress: 0,
-		lastFfric: 0,
-		blockedWall: false
-	};
+	const p = createMechanicalBody({
+		kind: 'piston', magnet: false, x, y, axis, moveAxis: axis,
+		pos: axis === 'h' ? x : y, limited: !unlimited
+	});
 	pistons.push(p);
 	syncPistonOccupancy();
 	selectedItem = { kind: 'piston', ref: p };
@@ -1188,12 +1227,71 @@ function returnPiston(p) {
 	const i = pistons.indexOf(p);
 	if (i < 0) return;
 	pistons.splice(i, 1);
-	if (selectedItem && selectedItem.kind === 'piston' && selectedItem.ref === p) selectedItem = null;
-	if (p.limited) INV.piston.count++;
+	if (selectedItem && (selectedItem.kind === 'piston' || selectedItem.kind === 'solenoid') && selectedItem.ref === p) selectedItem = null;
+	if (p.limited) {
+		if (p.magnet) INV.solenoid.count++;
+		else INV.piston.count++;
+	}
 	syncPistonOccupancy();
 	bus.emit('air:changed');
+	bus.emit('wire:placed');
 	renderProperties();
-	logger('Returned piston', 'sys');
+	logger(p.magnet ? 'Returned magnet piston' : 'Returned piston', 'sys');
+}
+
+function cellIsConductor(idx) {
+	if (idx < 0 || idx >= GRID_W * GRID_H) return false;
+	if (blocked[idx]) return false;
+	if (metalCells[idx]) return true;
+	if (manualWires.some(w => w.cells.includes(idx))) return true;
+	if (manualBatteries.some(b => b.poles.includes(idx))) return true;
+	if (lamps.some(l => l.idx === idx)) return true;
+	if (pumps.some(p => p.idx === idx)) return true;
+	if (switches.some(s => s.idx === idx && s.value)) return true;
+	return false;
+}
+
+function placeSolenoid(x, y) {
+	if (x < 0 || x >= GRID_W || y < 0 || y >= GRID_H) return;
+	const existing = pistons.find(p => bodyCells(p).includes(y * GRID_W + x));
+	if (existing) {
+		selectedItem = { kind: existing.magnet ? 'solenoid' : 'piston', ref: existing };
+		renderProperties(); return;
+	}
+	if (!unlimited && INV.solenoid.count <= 0) { logger('No magnet piston left', 'err'); return; }
+
+	const idx = y * GRID_W + x;
+	const hFit = (x + 1 < GRID_W) && grid[idx] === 0 && grid[idx + 1] === 0 && !blocked[idx] && !blocked[idx + 1];
+	const vFit = (y + 1 < GRID_H) && grid[idx] === 0 && grid[idx + GRID_W] === 0 && !blocked[idx] && !blocked[idx + GRID_W];
+	const isVertTunnel = (x === 0 || grid[idx - 1] === 1) && (x === GRID_W - 1 || grid[idx + 1] === 1);
+	const isHorizTunnel = (y === 0 || grid[idx - GRID_W] === 1) && (y === GRID_H - 1 || grid[idx + GRID_W] === 1);
+
+	let axis = 'h', moveAxis = 'h';
+	// 1-wide tunnel → Case B (axis = motion). Case A only when the 2-cell body
+	// spans two conductor cells on opposite ends (rails on the long-axis tips).
+	const hEnds = hFit && x > 0 && x + 2 < GRID_W && cellIsConductor(idx - 1) && cellIsConductor(idx + 2);
+	const vEnds = vFit && y > 0 && y + 2 < GRID_H && cellIsConductor(idx - GRID_W) && cellIsConductor(idx + 2 * GRID_W);
+	if (isVertTunnel && vFit) { axis = 'v'; moveAxis = 'v'; }
+	else if (isHorizTunnel && hFit) { axis = 'h'; moveAxis = 'h'; }
+	else if (hEnds) { axis = 'h'; moveAxis = 'v'; }
+	else if (vEnds) { axis = 'v'; moveAxis = 'h'; }
+	else if (hFit) { axis = 'h'; moveAxis = 'h'; }
+	else if (vFit) { axis = 'v'; moveAxis = 'v'; }
+	else { logger('Magnet piston needs a 2x1 corridor', 'err'); return; }
+
+	if (!unlimited) INV.solenoid.count--;
+	const p = createMechanicalBody({
+		kind: 'solenoid', magnet: true, x, y, axis, moveAxis,
+		pos: moveAxis === 'h' ? x : y, limited: !unlimited
+	});
+	pistons.push(p);
+	syncPistonOccupancy();
+	selectedItem = { kind: 'solenoid', ref: p };
+	bus.emit('air:changed');
+	bus.emit('wire:placed');
+	renderProperties();
+	startSimLoop();
+	logger(`Placed magnet piston (${axis === moveAxis ? 'Case B' : 'Case A'}) at ${x},${y}`);
 }
 
 // Double-click handler: return the battery/wire/lamp under the cursor.
@@ -1229,12 +1327,8 @@ function handleReturnAt(x, y) {
 	if (portal) { if (selectedItem && selectedItem.kind === 'pipeportal' && selectedItem.ref === portal) selectedItem = null; returnPipePortal(portal); return; }
 	const pump = pumps.find(p => p.idx === idx);
 	if (pump) { if (selectedItem && selectedItem.kind === 'pump' && selectedItem.ref === pump) selectedItem = null; returnPump(pump); return; }
-	const piston = pistons.find(p => {
-		const x0 = Math.round(p.pos), y0 = p.y;
-		if (p.axis === 'h') return (x0 === x || x0 + 1 === x) && y0 === y;
-		else return p.x === x && (y0 === y || y0 + 1 === y);
-	});
-	if (piston) { if (selectedItem && selectedItem.kind === 'piston' && selectedItem.ref === piston) selectedItem = null; returnPiston(piston); return; }
+	const piston = pistons.find(p => bodyCells(p).includes(idx));
+	if (piston) { if (selectedItem && (selectedItem.kind === 'piston' || selectedItem.kind === 'solenoid') && selectedItem.ref === piston) selectedItem = null; returnPiston(piston); return; }
 	logger('Nothing to return here', 'sys');
 }
 
@@ -1314,6 +1408,8 @@ function pointerDown(x, y) {
 		placePipePortal(x, y);
 	} else if (activeTool === 'piston') {
 		placePiston(x, y);
+	} else if (activeTool === 'solenoid') {
+		placeSolenoid(x, y);
 	} else if (activeTool === 'pump') {
 		placePump(x, y);
 	} else if (activeTool === 'select') {

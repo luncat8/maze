@@ -21,25 +21,17 @@ function syncPistonOccupancy() {
 	airVol.fill(CELL_VOL);
 	for (let k = 0; k < pistons.length; k++) {
 		const p = pistons[k];
-		if (p.axis === 'h') {
-			const y = p.y;
-			const p0 = p.pos, p1 = p.pos + 2.0;
-			const minX = Math.max(0, Math.floor(p0));
-			const maxX = Math.min(GRID_W - 1, Math.floor(p1));
+		const r = bodyRect(p);
+		const minX = Math.max(0, Math.floor(r.x0));
+		const maxX = Math.min(GRID_W - 1, Math.floor(r.x1));
+		const minY = Math.max(0, Math.floor(r.y0));
+		const maxY = Math.min(GRID_H - 1, Math.floor(r.y1));
+		for (let y = minY; y <= maxY; y++) {
 			for (let x = minX; x <= maxX; x++) {
-				const overlap = Math.max(0, Math.min(x + 1.0, p1) - Math.max(x + 0.0, p0));
-				const idx = y * GRID_W + x;
-				pistonOcc[idx] = Math.min(1.0, pistonOcc[idx] + overlap);
-				airVol[idx] = Math.max(1e-3, (1.0 - pistonOcc[idx]) * CELL_VOL);
-				if (pistonOcc[idx] >= PISTON_FULL) { airN[idx] = 0; airU[idx] = 0; }
-			}
-		} else {
-			const x = p.x;
-			const p0 = p.pos, p1 = p.pos + 2.0;
-			const minY = Math.max(0, Math.floor(p0));
-			const maxY = Math.min(GRID_H - 1, Math.floor(p1));
-			for (let y = minY; y <= maxY; y++) {
-				const overlap = Math.max(0, Math.min(y + 1.0, p1) - Math.max(y + 0.0, p0));
+				const ox = Math.max(0, Math.min(x + 1.0, r.x1) - Math.max(x + 0.0, r.x0));
+				const oy = Math.max(0, Math.min(y + 1.0, r.y1) - Math.max(y + 0.0, r.y0));
+				const overlap = Math.min(1, ox) * Math.min(1, oy);
+				if (overlap <= 0) continue;
 				const idx = y * GRID_W + x;
 				pistonOcc[idx] = Math.min(1.0, pistonOcc[idx] + overlap);
 				airVol[idx] = Math.max(1e-3, (1.0 - pistonOcc[idx]) * CELL_VOL);
@@ -50,26 +42,14 @@ function syncPistonOccupancy() {
 }
 
 function faceBlocked(i, j) {
-	// Hermetic sealing: air cannot permeate through the solid piston interior
+	// Hermetic sealing: air cannot permeate through the solid piston interior.
+	const ix = i % GRID_W, iy = (i / GRID_W) | 0;
+	const jx = j % GRID_W, jy = (j / GRID_W) | 0;
+	const faceX = (ix + jx) * 0.5 + 0.5;
+	const faceY = (iy + jy) * 0.5 + 0.5;
 	for (let k = 0; k < pistons.length; k++) {
-		const p = pistons[k];
-		if (p.axis === 'h') {
-			const cy = (i / GRID_W) | 0;
-			if (cy !== p.y) continue;
-			if (Math.abs(i - j) === 1) {
-				const xLeft = Math.min(i % GRID_W, j % GRID_W);
-				const faceX = xLeft + 1.0;
-				if (faceX > p.pos + 1e-4 && faceX < p.pos + 2.0 - 1e-4) return true;
-			}
-		} else {
-			const cx = i % GRID_W;
-			if (cx !== p.x) continue;
-			if (Math.abs(i - j) === GRID_W) {
-				const yTop = Math.min((i / GRID_W) | 0, (j / GRID_W) | 0);
-				const faceY = yTop + 1.0;
-				if (faceY > p.pos + 1e-4 && faceY < p.pos + 2.0 - 1e-4) return true;
-			}
-		}
+		const r = bodyRect(pistons[k]);
+		if (faceX > r.x0 + 1e-4 && faceX < r.x1 - 1e-4 && faceY > r.y0 + 1e-4 && faceY < r.y1 - 1e-4) return true;
 	}
 	return false;
 }
@@ -92,7 +72,9 @@ function airRelax(sweeps, dt) {
 	const hsSet = new Set(heatSinks.map(h => h.idx));   // placed Heat Sink cells
 	const LIM = CFL_FRAC * N0 / dt;                     // per-face mass-flow cap (kg/s)
 	const pAmb = N0 * R_SPEC * T_AMB * P_SCALE;
-	const pOf = (n, e, v = CELL_VOL) => (n / Math.max(1e-3, v)) * R_SPEC * (T_AMB + (n > N_MIN ? e / (n * AIR_CP) : 0)) * P_SCALE;
+	const tOf = (n, e) => n > N_MIN ? e / (n * AIR_CV) : 0;
+	const hOf = (n, e) => AIR_CP * tOf(n, e); // excess specific enthalpy
+	const pOf = (n, e, v = CELL_VOL) => (n / Math.max(1e-3, v)) * R_SPEC * (T_AMB + tOf(n, e)) * P_SCALE;
 	for (let it = 0; it < sweeps; it++) {
 		// (1) CONDUCTION + SOURCE + COOLING on internal energy (J). The
 		// snapshot prevU keeps conduction conservative (ΣU unchanged; only
@@ -111,10 +93,11 @@ function airRelax(sweeps, dt) {
 				const m = ny * GRID_W + nx; if (!isAir(m)) continue;   // walls = no-flux
 				if (faceBlocked(i, m)) continue;                     // hermetic piston body = no flux
 				const k = Math.min(cellOpen[i], cellOpen[m]);         // throttled by valve/portal
-				flux += k * G_COND * (prevU[m] - prevU[i]) / C_AIR_REAL;  // Σ G·(T_m − T_i), W
+				flux += k * G_COND * (tOf(airN[m], prevU[m]) - tOf(airN[i], prevU[i]));
 			}
-			let cool = (coolingEnabled ? G_LOSS : 0) * prevU[i] / C_AIR_REAL; // W to ambient
-			if (hsSet.has(i)) cool += G_SINK * prevU[i] / C_AIR_REAL;        // Heat Sink item
+			const Ti = tOf(airN[i], prevU[i]);
+			let cool = (coolingEnabled ? G_LOSS : 0) * Ti; // W to ambient
+			if (hsSet.has(i)) cool += G_SINK * Ti;        // Heat Sink item
 			const nv = prevU[i] + dt * (flux + heatSource[i] - cool); // W·s = J
 			const d = Math.abs(nv - prevU[i]); if (d > maxD) maxD = d;
 			airU[i] = nv > 0 ? nv : 0;
@@ -142,7 +125,7 @@ function airRelax(sweeps, dt) {
 				const cap = CFL_FRAC * Math.min(prevN[i], prevN[j], (airVol[i] / CELL_VOL) * N0, (airVol[j] / CELL_VOL) * N0) / dt;
 				if (J > cap) J = cap; else if (J < -cap) J = -cap;
 				const s = J > 0 ? i : j;                          // upwind source cell
-				const eS = prevE[s] / prevN[s];                   // specific excess energy J/kg
+				const eS = hOf(prevN[s], prevE[s]);               // specific excess enthalpy
 				dN[i] -= J; dN[j] += J;
 				dE[i] -= J * eS; dE[j] += J * eS;
 			}
@@ -160,7 +143,7 @@ function airRelax(sweeps, dt) {
 			const cap = CFL_FRAC * Math.min(prevN[p.a], prevN[p.b]) / dt;
 			if (J > cap) J = cap; else if (J < -cap) J = -cap;
 			const s = J > 0 ? p.a : p.b;
-			const eS = prevE[s] / prevN[s];
+			const eS = hOf(prevN[s], prevE[s]);
 			dN[p.a] -= J; dN[p.b] += J;
 			dE[p.a] -= J * eS; dE[p.b] += J * eS;
 		}
@@ -193,7 +176,7 @@ function airRelax(sweeps, dt) {
 			let eta_press = 0;
 			if (dP <= 0) eta_press = 0.5;
 			else if (dP < dP_stall) eta_press = 4 * (dP / dP_stall) * (1 - dP / dP_stall);
-			const Tin = T_AMB + (prevN[inIdx] > N_MIN ? prevE[inIdx] / (prevN[inIdx] * AIR_CP) : 0);
+			const Tin = T_AMB + tOf(prevN[inIdx], prevE[inIdx]);
 			const eta_temp = Math.sqrt(T_AMB / Math.max(100, Tin));
 			const eta_base = p.efficiency != null ? p.efficiency : 0.70;
 			const eta_result = Math.max(0, Math.min(1, eta_base * eta_press * eta_temp));
@@ -207,7 +190,7 @@ function airRelax(sweeps, dt) {
 			}
 			const maxDm = prevN[inIdx] * 0.3 / dt;
 			let J = Math.min(flowRate, maxDm);
-			const eS = prevE[inIdx] / prevN[inIdx];
+			const eS = hOf(prevN[inIdx], prevE[inIdx]);
 			dN[inIdx] -= J; dN[outIdx] += J;
 			dE[inIdx] -= J * eS; dE[outIdx] += J * eS;
 
@@ -228,7 +211,7 @@ function airRelax(sweeps, dt) {
 			const s = airSources[k]; if (!isAir(s.idx)) continue;
 			const dm = s.rate * dt;
 			airN[s.idx] += dm;
-			airU[s.idx] += dm * AIR_CP * (s.temp - T_AMB);
+			airU[s.idx] += dm * AIR_CV * (s.temp - T_AMB);
 		}
 		for (let k = 0; k < airSinks.length; k++) {
 			const s = airSinks[k]; if (!isAir(s.idx)) continue;
@@ -244,121 +227,99 @@ function airRelax(sweeps, dt) {
 			const mass = p.mass || 100;
 			const friction = p.friction != null ? p.friction : 50;
 			const damping = p.damping || 200;
+			const ma = bodyMoveAxis(p);
+			const span = bodySpan(p);
+			const area = (p.axis === ma) ? 1.0 : 2.0; // face area (m²); Case A is 2-wide
+			const moveH = ma === 'h';
+			const limit = moveH ? GRID_W : GRID_H;
+			let minPos = 0, maxPos = limit - span;
 
-			let minPos = 0, maxPos = (p.axis === "h" ? GRID_W : GRID_H) - 2;
-
-			if (p.axis === "h") {
-				const y = p.y;
-				const curLeft = Math.floor(p.pos);
-				const curRight = Math.floor(p.pos + 2.0);
-				for (let x = curLeft; x >= 0; x--) {
-					const idx = y * GRID_W + x;
-					if (grid[idx] !== 0 || blocked[idx] || pumps.some(pmp => pmp.idx === idx)) { minPos = x + 1; break; }
+			function sliceBlocked(coord) {
+				if (coord < 0 || coord >= limit) return true;
+				const r = bodyRect(p);
+				if (moveH) {
+					const y0 = Math.floor(r.y0 + 1e-9), y1 = Math.ceil(r.y1 - 1e-9) - 1;
+					for (let y = y0; y <= y1; y++) {
+						const idx = y * GRID_W + coord;
+						if (grid[idx] !== 0 || blocked[idx] || pumps.some(pmp => pmp.idx === idx)) return true;
+					}
+				} else {
+					const x0 = Math.floor(r.x0 + 1e-9), x1 = Math.ceil(r.x1 - 1e-9) - 1;
+					for (let x = x0; x <= x1; x++) {
+						const idx = coord * GRID_W + x;
+						if (grid[idx] !== 0 || blocked[idx] || pumps.some(pmp => pmp.idx === idx)) return true;
+					}
 				}
-				for (let x = curRight; x < GRID_W; x++) {
-					const idx = y * GRID_W + x;
-					if (grid[idx] !== 0 || blocked[idx] || pumps.some(pmp => pmp.idx === idx)) { maxPos = x - 2; break; }
-				}
-			} else {
-				const x = p.x;
-				const curTop = Math.floor(p.pos);
-				const curBot = Math.floor(p.pos + 2.0);
-				for (let y = curTop; y >= 0; y--) {
-					const idx = y * GRID_W + x;
-					if (grid[idx] !== 0 || blocked[idx] || pumps.some(pmp => pmp.idx === idx)) { minPos = y + 1; break; }
-				}
-				for (let y = curBot; y < GRID_H; y++) {
-					const idx = y * GRID_W + x;
-					if (grid[idx] !== 0 || blocked[idx] || pumps.some(pmp => pmp.idx === idx)) { maxPos = y - 2; break; }
-				}
+				return false;
 			}
+			const curLo = Math.floor(p.pos);
+			const curHi = Math.floor(p.pos + span);
+			for (let c = curLo; c >= 0; c--) { if (sliceBlocked(c)) { minPos = c + 1; break; } }
+			for (let c = curHi; c < limit; c++) { if (sliceBlocked(c)) { maxPos = c - span; break; } }
 
-			// Helper to get chamber properties along corridor
 			function getChamber(X0, X1) {
 				let mR = 0, uR = 0, vR = 0;
 				let mF = 0, uF = 0, vF = 0;
 				const rCells = [], fCells = [];
 				const rVols = [], fVols = [];
-
-				if (p.axis === "h") {
-					const y = p.y;
-					for (let x = minPos; x <= Math.floor(X0); x++) {
-						const idx = y * GRID_W + x;
-						if (grid[idx] === 0) {
-							const v = x < Math.floor(X0) ? CELL_VOL : Math.max(0, (X0 - x) * CELL_VOL);
-							if (v > 1e-5 || x < Math.floor(X0)) {
-								rCells.push(idx); rVols.push(v);
-								mR += airN[idx]; uR += airU[idx]; vR += v;
-							}
-						}
-					}
-					const endX = Math.min(GRID_W - 1, maxPos + 1);
-					for (let x = Math.floor(X1); x <= endX; x++) {
-						const idx = y * GRID_W + x;
-						if (grid[idx] === 0) {
-							const v = x > Math.floor(X1) ? CELL_VOL : Math.max(0, (x + 1.0 - X1) * CELL_VOL);
-							if (v > 1e-5 || x > Math.floor(X1)) {
-								fCells.push(idx); fVols.push(v);
-								mF += airN[idx]; uF += airU[idx]; vF += v;
-							}
-						}
-					}
-				} else {
-					const x = p.x;
-					for (let y = minPos; y <= Math.floor(X0); y++) {
-						const idx = y * GRID_W + x;
-						if (grid[idx] === 0) {
-							const v = y < Math.floor(X0) ? CELL_VOL : Math.max(0, (X0 - y) * CELL_VOL);
-							if (v > 1e-5 || y < Math.floor(X0)) {
-								rCells.push(idx); rVols.push(v);
-								mR += airN[idx]; uR += airU[idx]; vR += v;
-							}
-						}
-					}
-					const endY = Math.min(GRID_H - 1, maxPos + 1);
-					for (let y = Math.floor(X1); y <= endY; y++) {
-						const idx = y * GRID_W + x;
-						if (grid[idx] === 0) {
-							const v = y > Math.floor(X1) ? CELL_VOL : Math.max(0, (y + 1.0 - X1) * CELL_VOL);
-							if (v > 1e-5 || y > Math.floor(X1)) {
-								fCells.push(idx); fVols.push(v);
-								mF += airN[idx]; uF += airU[idx]; vF += v;
-							}
+				const r = bodyRect(Object.assign({}, p, { pos: X0 }));
+				const perp0 = moveH ? Math.floor(r.y0 + 1e-9) : Math.floor(r.x0 + 1e-9);
+				const perp1 = moveH ? Math.ceil(r.y1 - 1e-9) - 1 : Math.ceil(r.x1 - 1e-9) - 1;
+				const nPerp = Math.max(1, perp1 - perp0 + 1);
+				function addCell(coord, isRear, vol1) {
+					for (let s = perp0; s <= perp1; s++) {
+						const idx = moveH ? (s * GRID_W + coord) : (coord * GRID_W + s);
+						if (grid[idx] !== 0) continue;
+						const v = vol1;
+						if (v > 1e-5 || (isRear ? coord < Math.floor(X0) : coord > Math.floor(X1))) {
+							if (isRear) { rCells.push(idx); rVols.push(v); mR += airN[idx]; uR += airU[idx]; vR += v; }
+							else { fCells.push(idx); fVols.push(v); mF += airN[idx]; uF += airU[idx]; vF += v; }
 						}
 					}
 				}
-				return { mR, uR, vR, rCells, rVols, mF, uF, vF, fCells, fVols };
+				for (let c = minPos; c <= Math.floor(X0); c++) {
+					const v = c < Math.floor(X0) ? CELL_VOL : Math.max(0, (X0 - c) * CELL_VOL);
+					addCell(c, true, v);
+				}
+				const endC = Math.min(limit - 1, maxPos + span - 1);
+				for (let c = Math.floor(X1); c <= endC; c++) {
+					const v = c > Math.floor(X1) ? CELL_VOL : Math.max(0, (c + 1.0 - X1) * CELL_VOL);
+					addCell(c, false, v);
+				}
+				return { mR, uR, vR, rCells, rVols, mF, uF, vF, fCells, fVols, nPerp };
 			}
 
-			const ch = getChamber(p.pos, p.pos + 2.0);
+			const ch = getChamber(p.pos, p.pos + span);
 
 			let pBack = pAmb, pFront = pAmb;
 			if (ch.vR >= 0.15 * CELL_VOL && ch.mR > N_MIN) {
-				const tRear = ch.uR / (ch.mR * AIR_CP);
+				const tRear = ch.uR / (ch.mR * AIR_CV);
 				pBack = (ch.mR / ch.vR) * R_SPEC * (T_AMB + tRear) * P_SCALE;
 			}
 			if (ch.vF >= 0.15 * CELL_VOL && ch.mF > N_MIN) {
-				const tFront = ch.uF / (ch.mF * AIR_CP);
+				const tFront = ch.uF / (ch.mF * AIR_CV);
 				pFront = (ch.mF / ch.vF) * R_SPEC * (T_AMB + tFront) * P_SCALE;
 			}
 
-			const F_press = (pBack - pFront) * 1.0;
+			const F_press = (pBack - pFront) * area;
 			p.lastFpress = F_press;
+			const F_coil = p.lastFcoil || 0;
+			const F_drive = F_press + F_coil;
 
 			const F_static = 1.2 * friction;
 			let F_fric = 0, F_net = 0;
 			if (Math.abs(p.vel) < 1e-4) {
-				if (Math.abs(F_press) <= F_static) {
+				if (Math.abs(F_drive) <= F_static) {
 					p.vel = 0;
-					F_fric = -F_press;
+					F_fric = -F_drive;
 					F_net = 0;
 				} else {
-					F_fric = -Math.sign(F_press) * friction;
-					F_net = F_press + F_fric;
+					F_fric = -Math.sign(F_drive) * friction;
+					F_net = F_drive + F_fric;
 				}
 			} else {
 				F_fric = -Math.sign(p.vel) * friction - damping * p.vel;
-				F_net = F_press + F_fric;
+				F_net = F_drive + F_fric;
 			}
 			p.lastFfric = F_fric;
 
@@ -381,12 +342,19 @@ function airRelax(sweeps, dt) {
 
 			const dPos = newPos - p.pos;
 			if (Math.abs(dPos) > 1e-7) {
+				const dV = dPos * area;
+				// Excess-pressure P–V: ambient bulk is isothermal (U stays 0),
+				// so mass-overwrite tests stay green; compressed extra mass still heats.
+				ch.uR -= (pBack - pAmb) * dV;
+				ch.uF += (pFront - pAmb) * dV;
+				if (ch.uR < 0) ch.uR = 0;
+				if (ch.uF < 0) ch.uF = 0;
 				p.pos = newPos;
-				p.x = p.axis === "h" ? Math.round(newPos) : p.x;
-				p.y = p.axis === "v" ? Math.round(newPos) : p.y;
+				if (ma === 'h') p.x = Math.round(newPos);
+				else p.y = Math.round(newPos);
 				syncPistonOccupancy();
 
-				const chNew = getChamber(newPos, newPos + 2.0);
+				const chNew = getChamber(newPos, newPos + span);
 
 				if (chNew.vR > 1e-4 && ch.mR > 0) {
 					for (let i = 0; i < chNew.rCells.length; i++) {
@@ -407,13 +375,13 @@ function airRelax(sweeps, dt) {
 			}
 		}
 		syncPistonOccupancy();
-		// (4) derive temp = U / (airN·cp); clamps (safety net only). pressure
+		// (4) derive temp = U / (airN·cv); clamps (safety net only). pressure
 		//     P = n·R·T_abs now depends on mass, temperature, AND cut-cell airVol.
 		for (let i = 0; i < N; i++) {
 			if (!isAir(i)) { temp[i] = 0; pressure[i] = 0; continue; }
 			const n = airN[i];
-			let t = n > N_MIN ? airU[i] / (n * AIR_CP) : 0;
-			if (t > T_MAX) { t = T_MAX; airU[i] = n * AIR_CP * T_MAX; }
+			let t = n > N_MIN ? airU[i] / (n * AIR_CV) : 0;
+			if (t > T_MAX) { t = T_MAX; airU[i] = n * AIR_CV * T_MAX; }
 			if (t < 0) { t = 0; airU[i] = 0; }
 			temp[i] = t;
 			pressure[i] = (n / Math.max(1e-3, airVol[i])) * R_SPEC * (T_AMB + t) * P_SCALE;
