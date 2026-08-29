@@ -1,374 +1,575 @@
-# Solenoid / Magnetic Coupling — Implementation Plan
+# Solenoid / Magnetic DC Machine — Implementation Plan
 
 Status: PLAN (not yet implemented). Author session notes 2026-08-29.
 
----
+**Rev 3 — proper field-based magneto-electric model.** What changed vs Rev 2:
 
-## 1. What the drawing asks for
-
-Reference sketch (`solenoid.webp`), three numbered effects:
-
-1. **Pressure** drives a magnet-fitted 2×1 piston in a tube (already works — the
-   piston/pump feature).
-2. **Moving solenoid magnet causes electric field** — a magnet moving through a
-   coil induces an EMF → **generator** (Faraday/Lenz). This is *new*.
-3. **Field causes force on solenoid magnet** — current in a coil pushes/pulls the
-   magnet → **actuator/motor** (Lorentz). This is *new*.
-
-So the feature is a **bidirectional electromechanical transducer** between the
-existing two engines:
-
-```
-  air pressure ─► piston (magnet) ──motion──► coil ──EMF──► electric grid
-  electric grid ──current──► coil ──Lorentz──► magnet piston ─► air pressure
-```
-
-Energy conserves by construction (same coupling constant `Kc` on both sides).
+- **No more "coil detection".** The magnet does NOT scan neighbouring lines and
+  pattern-match a pair of conductors. Instead we compute the **magnetic field
+  over the whole grid from the actual currents** flowing in every conductor
+  (wires, metal floor, loads, the moving armature bridge). The magnet responds
+  to that field directly: its force comes from **B and ∇B at its own
+  location**.
+- **"A coil" is therefore anything that carries current** — a single wire, a
+  loop, two rails, a painted metal strip, an arbitrary L-shaped wire run.
+  Whatever the shape, the same kernel produces the field, the force, and the
+  back-EMF. No fixed-geometry special cases.
+- **Energy is conserved exactly by construction:** force and back-EMF are
+  derived from the **same per-conductor kernel** (reciprocity), so
+  `Σ_e EMF_e·I_e + F·v = 0` per frame, automatically. Lenz drag and motor
+  back-EMF both *emerge*; they are not added as separate terms.
+- Case A (magnet rides on the rails, loop closes through the body) and
+  Case B (magnet between conductors, loop closes elsewhere) are **emergent
+  configurations** — one code path, no branch on geometry.
 
 ---
 
-## 2. Hard constraints (must not break)
+## 1. What the sketch asks for
 
-- Vanilla JS + `<canvas>`, **no build step**, must run from `file://`.
-- `state.js` direction order is fixed: `0=Up(0,-1) 1=Right(1,0) 2=Down(0,1) 3=Left(-1,0)`
-  (`dirs[]`). Pump/solenoid direction tables MUST use this same order.
-- Keep the continuous, shader-friendly, mass-conserving piston model added for
-  the jitter fix (chamber-integrated pressure + proportional redistribution in
-  `air.js`). Do **not** revert to discrete offset-shift / manual mass moves.
-- `isAir` stays decoupled from `blocked`; partial piston occupancy keeps reduced
-  `airVol`; pressure stays `P = (n/airVol)·R·T`.
-- Electricity consumes power like a lamp/pump (has R + efficiency), is **free in
-  GODMODE**, and reports waste heat to the air.
-- Field engine is the live engine (`activeEngine='field'`). Circuit engine is
-  frozen/obsolete — add the coil to the **field** path only; do not extend
-  circuit engine.
-- Piston typical speed stays ~0.1–5 cells/s.
+Reference sketch (`08-plan-solenoid.webp`), three numbered effects:
+
+1. **Pressure** drives a magnet-fitted 2×1 piston in a tube (exists).
+2. **Moving magnet produces electricity** in the conductors around it
+   (Faraday; generator).
+3. **Current produces force on the magnet** (Lorentz; actuator).
+
+The feature is a **bidirectional electromechanical transducer** between the
+air engine and the electric engine, with a single coupling constant and a
+single kernel so energy is kept in both directions.
 
 ---
 
-## 3. Physics model (shader-friendly, continuous)
+## 2. The physical model (core)
 
-### 3.1 Coupling profile — one smooth scalar kernel
+### 2.1 Convention for the 2D top view
 
-For a **magnet piston** `p` and a **coil** `c`, define the signed axial gap
-`Δ`:
+- Conductors (wires, metal floor, loads, battery poles) are cells with a
+  voltage from the field solve; **currents flow in the board plane** along the
+  grid edges between adjacent conductor cells (this is already exactly what
+  `js/electric.js` computes — see `computeHeatSource`, which already
+  evaluates per-edge `dV` and `Re = heatR[i]+heatR[j]`).
+- In-plane currents create a magnetic field **perpendicular to the board**:
+  one scalar field `Bz(x, y)` (sign = direction out of / into the board,
+  standard right-hand rule). This is what makes the hand rule work: current →
+  `Bz` → force on the magnet, all deterministic.
+- A magnet body is modelled as a **magnetic dipole with out-of-plane moment
+  `m`** (game convention; think of a magnetized puck: S face down / N face up
+  on the board). `m` is a signed slider (`magStrength`, ±) — its sign is the
+  polarity / "winding". The red/blue pole caps drawn on the body ends are the
+  ± rail contacts (Case A) and the visual polarity of the equivalent loop
+  current; the ⊙/⊗ symbols on the body show the **moment direction** `m`
+  (out of / into the board).
 
-- horizontal coil (`c.axis='h'`), magnet travels in x:
-  `Δ = magnetCenterX − coilCenterX = (p.pos + 1.0) − (c.x + 0.5)`
-- vertical coil (`c.axis='v'`), magnet travels in y:
-  `Δ = (p.pos + 1.0) − (c.y + 0.5)`
+### 2.2 Currents are taken from the field solution
 
-Only couple when the magnet and coil share the tube line (same `y` for h, same
-`x` for v) and the *perpendicular* offset is small. Use a smooth Gaussian kernel
-(no branchy discrete geometry, easy to port to a shader):
+For every conductive edge `e = (a→b)` in every active field system:
 
 ```
-coupling profile:   φ(Δ)   = exp(−Δ² / (2 σ²))          // σ ≈ 0.9 cells
-its spatial slope:  φ′(Δ)  = −(Δ/σ²) · φ(Δ)
+Re(e) = R[a] + R[b]                      // exactly as today (edgeR / gOf)
+I_e   = (V[a] − V[b] + E_e) / Re(e)      // signed, positive a→b
 ```
 
-- `φ` is the **flux linkage shape** (how much magnet flux threads the coil).
-- `φ′` is the rate of change of linkage with magnet position.
+where `E_e` is the magnet-induced back-EMF in that edge (§2.4; zero when no
+magnet is moving). Edges are stored with a **fixed orientation** (low cell
+index → high cell index, row-major) so `I_e` and the kernel are unambiguous.
 
-### 3.2 Generator (effect 2): motion → EMF
+`I_e ≠ 0` **only where cells are at different voltage** — which is exactly the
+draft's rule ("force in the cell between different voltage"). A bare wire
+carrying no current produces no field; the moment current appears, the field,
+the force, and the EMF follow from one kernel.
 
-Faraday: motional EMF in the coil =
+### 2.3 Magnetic field from actual currents (Biot–Savart, one kernel)
+
+Each conductive edge is a small current element at its midpoint
+`r_e = ((a+b)/2 cell coords)`, direction `dl_e` = unit vector along the edge
+(±x or ±y). The field at any point `x`:
+
 ```
-EMF_gen = Kc · φ′(Δ) · v            [volts]
+r        = x − r_e
+g_e(x)   = (dl_e × r)_z / (|r|² + σ_B²)
+         = (dl_x·r_y − dl_y·r_x) / (r_x² + r_y² + σ_B²)
+
+Bz(x)    = K_B · Σ_e  I_e · g_e(x)
 ```
-where `v = p.vel` (cells/s), `Kc` = coupling constant (V·s/cell per magnet
-strength), tuned in the GUI. Sign of `φ′` handles approach vs. leave and
-direction automatically.
 
-In the **field diffusion engine** this becomes a Norton current injection — the
-*same mechanism already used for batteries* in `electric.js`
-(`g_int = 1/R`, `I_n = V/R` injected at + terminal, `−I_n` at − terminal):
+- `K_B` = global magnetic constant (in-game "permeability" gain, GUI slider) —
+  the single knob that replaces the old `Kc`.
+- `σ_B ≈ 0.5 cell` soft core: regularizes the kernel where the magnet touches a
+  conductor (Case A rides ON the rails) and keeps forces smooth across cell
+  boundaries (same jitter requirement as the piston model).
+- **Cutoff radius** `r_max ≈ 8 cells`: beyond it the 1/r kernel is negligible;
+  a spatial hash on cells keeps `O(edges × near-magnets)` cheap. Both the
+  force and the EMF use the identical kernel so the truncation cannot break
+  energy (nothing outside the cutoff is coupled at all).
 
-- Coil self-resistance `c.R` → internal conductance `g_c = 1/c.R`.
-- Injected current `I_n = EMF_gen / c.R` at the coil's + terminal and `−I_n` at
-  its − terminal (terminal polarity = `c.dir`; winding sign via `c.winding ±1`).
-- Coil must be a finite-resistance conductor node in the component DSU so its
-  terminals are part of a closed loop; if there is no external load the coil's
-  own `g_c` simply recirculates the current (no energy delivered — open circuit).
-- Delivered electrical power (read out like pump `lastPower`):
-  `P_elec = EMF_gen · I_ext`, where `I_ext = I_n − g_c·(V+ − V−)`.
+### 2.4 Force and back-EMF — one kernel, two directions (reciprocity)
 
-### 3.3 Actuator (effect 3): current → force
+For magnet `b` with moment `m_b`, position `x_b`, velocity `v_b` along its
+motion axis `â`:
 
-Lorentz force on the magnet from coil current:
+```math
+force (Lorentz/Laplace, motor + generator-return):
+F_b   = m_b · (∂Bz/∂x · â) = m_b · K_B · Σ_e I_e · (∂g_e/∂x · â)
+
+back-EMF per conductor edge (Faraday, induced by motion):
+E_e,b = −m_b · K_B · (∂g_e/∂x · â) · v_b        [V, positive a→b]
 ```
-F_coil = Kc · φ′(Δ) · I_coil        [newtons, along tube axis]
-```
-where `I_coil` = the current actually flowing through the coil. This is read
-straight from the field solution: the coil is a finite-R node, so its current is
-`I_coil = dV / c.R` using the same two-terminal `dV` readout the pump uses
-(`fieldPublish` pump branch). Sign: `φ′` already carries approach/leave; the
-current sign (which terminal is higher V) sets push vs. pull — exactly the
-`+` / `−` drawn beside the piston in the sketch.
 
-Waste heat (Joule) into the air at the coil cell, like the pump:
-`heatSource[c.idx] += I_coil²·c.R + P_elec·(1−η)` where η is an efficiency
-slider (like the pump). The inductor stores/releases a little energy; for a
-steady-state field solve we treat it as dissipative + coupled, no explicit L
-dynamics needed (field already relaxes over frames).
+- `∇B` is taken as the **analytic derivative of the same soft-core kernel**
+  (no grid differencing, no pattern matching): a single wire attracts/repels
+  the magnet and pulls toward its current; two opposite-current rails create a
+  strong `Bz` between them with gradients at the ends (the classic "pull into
+  the solenoid" behaviour); a metal floor with an eddy-like current pattern
+  pushes the magnet along its gradient. All of this is *output*, not code
+  paths.
+- Each magnet contributes `E_e,b` to every edge in range; the field solve
+  receives `E_e = Σ_b E_e,b` (multiple magnets simply superpose — two magnets
+  can drive one loop, which is exactly the demo scene).
 
-### 3.4 Energy consistency (why the signs are exact)
+### 2.5 Energy identity (why signs are exact)
 
-Mechanical power extracted by a moving magnet (Lenz drag) =
-`F_coil·v = Kc·φ′·I_coil·v = EMF_gen·I_coil`.
-So mechanical power out == electrical power generated, with the **same `Kc` and
-the same `φ′`** — the two effects share one kernel, guaranteeing energy
-conservation and that "generator drag" and "motor push" are one reciprocal
-coupling. The piston force in `air.js` therefore gains one extra term:
-```
-F_net = F_pressure + F_friction/damping  +  Σ_coils F_coil(p,c)
-```
-(plus the spring `F_spring` below). Reuse the existing static-friction lock and
-±6 clamp.
+With `F_b = m_b K_B Σ_e I_e ∂_x g_e` and `E_e,b = −m_b K_B v_b ∂_x g_e` (both
+from the same `g_e`), summing over edges and magnets:
 
-### 3.5 Return spring (solenoid feel)
+```math
+Σ_b F_b · v_b  =  Σ_b m_b K_B v_b Σ_e I_e ∂_x g_e
+               = −Σ_e (Σ_b E_e,b) I_e
+               = −Σ_e E_e · I_e
+```
 
-Real solenoids spring back when de-energised. Add a light centering spring so an
-unpowered actuator piston doesn't drift forever:
-```
-F_spring = −k_spring · (p.pos − p.restPos) − c_spring · v
-```
-`restPos` = the piston's placed position (captured on placement). Sliders for
-`k_spring` (N/cell), default small (e.g. 30 N/cell) so pressure can still
-overcome it. Generator mode benefits too: magnet slows and recentres after a
-pressure pulse, giving a clean EMF spike-and-decay.
+So **mechanical power + all induced-EMF sources' electrical power = 0** every
+frame, exactly, for any conductor geometry and any number of magnets:
+
+- **Generator** (magnet pushed by gas): induced `E_e` drives current in its own
+  direction → `Σ E_e I_e > 0` (power delivered to the circuit) → `F·v < 0`:
+  the magnet decelerates — **Lenz drag**.
+- **Motor** (battery drives current): current flows against the induced EMF →
+  `Σ E_e I_e < 0` → `F·v > 0`: the field pushes the magnet — and as `v` grows,
+  the induced EMF opposes the battery and **limits the current** (back-EMF).
+
+Nothing extra is coded for Lenz or back-EMF: they are the same term seen from
+each side. `ΣE·I = −F·v` is enforced by construction, so an energy audit closes
+to round-off for any wiring (single wire, loop, rails, floor, Case A, Case B).
+
+### 2.6 No detection, no special geometry (hard rule)
+
+- The magnet is coupled to **every edge within `r_max` that carries current**.
+  There is no code path that asks "is this a coil?" or matches a shape.
+- Placement only decides *what the body is* (Case A armature bridge is a
+  conductor; Case B body is not) — it never decides *what it couples to*.
+- `cellOccupied`/air/`cellR` never treat a magnet as "finding" conductors; the
+  field solve is the single source of truth.
 
 ---
 
-## 4. Data model / state (`js/state.js`)
+## 3. Hard constraints (must not break)
 
-New item registry (mirror `pumps`/`pistons`):
+- Vanilla JS + `<canvas>`, no build step, `file://`-runnable.
+- `state.js` dir order fixed: `0=Up(0,-1) 1=Right(1,0) 2=Down(0,1) 3=Left(-1,0)`;
+  every new table (edge orientation, kernel cross-product, pole mapping) uses it.
+- Keep the continuous, mass-conserving piston model in `air.js`; no discrete
+  offset shifts or manual mass moves; `isAir` vs `blocked`, `airVol`,
+  `P = (n/airVol)·R·T` unchanged.
+- Field engine only (`activeEngine='field'`); circuit engine frozen.
+- **No shape recognition / no fixed-coil geometry** anywhere in the magnetic
+  coupling (constraint for review, not just a guideline).
+- Electricity consumes power like a lamp/pump (GODMODE free), reports waste
+  heat to the air.
+- Body speeds stay ~0.1–5 cells/s (solenoid drives included).
+- Energy audit: `Σ E_e·I_e + Σ F_b·v_b = 0` to floating-point tolerance every
+  frame in tests.
+
+---
+
+## 4. The two cases (both emergent, no special-casing)
+
+### 4.1 Case A — magnet rides on the rails (loop closes through the body)
+
+```
+      battery
+      +  −
+      │  │
++++++[x+]++++         ← + rail row
+----- [x-] ----       ← − rail row
+```
+
+- The body is placed **perpendicular to its motion** (1×2, long axis across
+  the two rail rows); its pole cells sit on the two conductor rows. The rail
+  cells stay conductive (wires/metal are air-passable; a body overlapping
+  them does not change `cellR` of the rail cells themselves).
+- The **moving bridge through the body** is a conductor: while the body
+  occupies two adjacent conductor cells, the edge between them carries the
+  armature resistance `R_arm` (acting on the generic edge the solver already
+  builds; see §6.4). Battery → + rail → body bridge → − rail → battery is then
+  just a normal circuit. **The loop closes through the moving body — the two
+  rail ends need not be connected anywhere else.**
+- The magnet feels `F = m∇Bz` from the *rail* currents (the self bridge edge is
+  excluded from its own `Bz`; its own back-EMF is ~0 by the symmetric
+  soft-core kernel — see §6.5). Pushed by gas → rail currents are induced →
+  Lenz drag; driven by battery → the field pulls/torques it along.
+
+### 4.2 Case B — magnet between conductors (loop closes elsewhere)
+
+```
++++++          ← + rail row
+ xx            ← 2×1 magnet piston, axis along the tube
+-----          ← − rail row
+```
+
+- The magnet is a normal axial piston between the two conductor rows; the
+  wires never overlap it. Nothing in placement differs from a plain piston
+  except `magnet:true`.
+- If the rails (or any other conductors) form a closed loop elsewhere, the
+  field solve sees the loop; a moving magnet induces per-edge EMF on **all**
+  edges of the loop (rails **and** external wires and the battery/lamp branch
+  — the kernel attribute each edge by its own distance/gradient), so current
+  flows and the magnet feels the reaction force. **If the loop is open, there
+  is no current, no force, no energy** — nothing is invented.
+- Direction is deterministic: `fieldV` → `I_e` → `Bz`/`∇Bz` → `F`; reversing
+  the magnet polarity or the battery polarity reverses the force.
+
+### 4.3 What differs in code
+
+| | Case A | Case B |
+|---|---|---|
+| body orientation | `axis ≠ moveAxis` | `axis = moveAxis` |
+| moving bridge edge | yes (`R_arm`) | no |
+| conductor participation | body cells replace edge R by `R_arm` | none |
+| force / EMF paths | identical (§2.4 kernel) | identical |
+
+Both cases are covered by the same `fieldSimulate` → `fieldRelax` →
+`fieldPublish` → `airRelax` pipeline; only the mechanical body (`moveAxis`)
+and one edge-resistance rule differ.
+
+---
+
+## 5. Data model / state (`js/state.js`)
+
+Keep the Rev 2 **`createMechanicalBody()`** factory (composition, shared by
+piston and solenoid):
 
 ```js
-const solenoids = [];   // coils:  { id, x, y, idx, axis:'h'|'v', dir:0..3, winding:1|-1,
-                        //           R, efficiency, Kc, turns, limited,
-                        //           dV, lastPower, lastEMF, lastCurrent, lastHeat }
-let solenoidIdSeq = 0;
+function createMechanicalBody(spec) {
+  return {
+    id: ++bodyIdSeq,
+    kind: spec.kind,                 // 'piston' | 'solenoid'
+    x, y, axis, moveAxis,            // axis = long axis, moveAxis = motion axis
+    pos, vel: 0,
+    friction: 50, damping: 200, mass: 100,
+    limited: !unlimited,
+    magnet: !!spec.magnet,           // plain pistons stay magnet:false
+    magStrength: spec.magStrength ?? 1,   // signed dipole moment m (±)
+    R_arm: spec.R_arm ?? 2,          // Ω armature bridge (Case A)
+    efficiency: spec.efficiency ?? 0.85,
+    lastFpress: 0, lastFfric: 0, lastFcoil: 0,
+    lastBz: 0, lastEMF: 0, lastCurrent: 0, lastPower: 0, lastHeat: 0,
+    blockedWall: false
+  };
+}
 ```
-- `axis` = coil axis / tube axis (parallel to the magnet travel). `dir` picks
-  which conductor neighbour is the **+ terminal** (opposite neighbour is −).
-  Reuse `PUMP_DIRS` (identical 0=N,1=E,2=S,3=W ordering) — rename/share as
-  `DIR4` if convenient, but keep order.
 
-Extend each piston (only when it carries a magnet):
-```js
-// on piston object:
-p.magnet     = true/false;   // toggle in GUI; default false so plain pistons unchanged
-p.magStrength= 1.0;          // scales Kc for this magnet
-p.kSpring    = 30;           // N/cell return spring
-p.restPos    = <pos on placement>;
-p.lastFcoil  = 0;            // readout: net coil force this frame
+- `bodies[]` replaces `pistons[]` (keep `const pistons = bodies` alias for
+  existing sites/tests); `INV.solenoid` = "Magnet Piston (Solenoid)" calling
+  the factory with `{kind:'solenoid', magnet:true}`.
+- **No `solenoids[]`, no `coil` fields, no poles stored on the body** — the
+  "coil" is whatever carries current near it (§2.6).
+- Occupancy/eraser/clear/seed gating: `bodies` everywhere `pistons` is today.
+- Mode A placement: needs a 2-cell corridor *across* two conductor rows/cols
+  (use `cellR`/wire/metal state, not a pattern); Mode B: like today's piston.
+- Readouts on the body: `lastBz` (field at body), `lastEMF` (signed
+  equivalent EMF = `lastPower / |lastCurrent|`, §6.6), `lastCurrent`
+  (armature / loop current), `lastFcoil`, `lastHeat`, `lastPower`
+  (signed conversion power: >0 generator, <0 motor).
+
+---
+
+## 6. Electric integration (`js/electric.js`, field engine only)
+
+### 6.1 Per-edge current + kernel registry
+
+In `fieldSimulate()`:
+
+- Collect a flat **edge list** per system: `{ a, b, Re, dl }`, `a<b`
+  (row-major), `dl` 1×2 vector in `dirs`-consistent orientation, `Re =
+  R[a]+R[b]`, with the existing forbidden-pairs (battery poles) skipped —
+  identical to what `computeHeatSource` already iterates (forward dirs only).
+- Keep the map keyed `min:max` so `fieldPublish` can write `I_e` back.
+- Build a **cell → edge indices** spatial hash for the kernel loops, and a
+  magnet list of **all** magnets (`bodies.filter(b => b.magnet)`). A magnet
+  contributes to `E_e` only while `|v_b| > tol`, but it contributes to `Bz`/
+  `F` **even at rest** — a stationary magnet inside an energized coil must
+  still be pushed (that is the motor case).
+
+### 6.2 Systems (extend the source-root rule)
+
+A relaxation system is built for a connected conductor component if it
+contains:
+
+- a battery (existing rule), **or**
+- a magnet-induced EMF — i.e. a moving magnet within coupling range **and** the
+  component has at least one cycle (closed loop, or a battery feeding it,
+  in which case the battery rule already applies).
+
+Ground: first battery `−` pole if any, else the first system node. A short
+open conductor run with no loop and no battery still forms no system (no
+current can flow; nothing to solve). Cycle check is free: in a connected
+component with `n` nodes, a cycle exists iff `edges > n − 1`.
+
+### 6.3 Per-edge EMF source (the "battery whose EMF varies with velocity")
+
+For every active system, before relaxation:
+
+```
+E_e = Σ_b E_e,b = −Σ_b m_b · K_B · (∂g_e(x_b)/∂x · â_b) · v_b
 ```
 
-Add to `INV` and `GOD_ITEMS`: `solenoid: { type:'solenoid', count:1, label:'Solenoid Coil' }`.
-`INV.solenoid`, GOD item `{ id:'solenoid', label:'Solenoid Coil', tool:'solenoid' }`.
+Injected as a **Norton source on the edge itself** (an edge EMF is exactly a
+Thevenin source in series with the edge's own resistance):
 
-Include coils in occupancy (`cellOccupied`), eraser/return, scene reset/clear
-lists, and `seedAir`/`heatAirActive` gating (`|| solenoids.length > 0`).
+```
+I_n(e) = E_e / Re(e)
+inj[b] += I_n(e)      // EMF pushes current a→b
+inj[a] −= I_n(e)
+```
 
-**Placement model (simple, grid-friendly):** a solenoid coil is placed **like an
-air pump** — on a corridor cell of the tube the magnet slides in. It is a
-sealed-for-the-magnet but **electrically conductive** cell:
-- Air: coil cell is NOT air (wall to flow), same as pump → add to `isAir`
-  exclusion and wall-clamp lists, and treat as obstacle in piston chamber scans
-  (mirror every `pumps.some(...)` site with `solenoids.some(...)`).
-- Electric: coil cell IS a conductor (finite `c.R`), exactly like a pump cell is
-  a conductor today in `cellR`. Its two terminals are the two conductor
-  neighbours along/normal as for a lamp/pump dV readout.
-- Magnetism: a magnet piston couples to a coil cell when it slides *through/past*
-  it on the same tube line, with `Δ` measured between magnet centre and coil
-  centre. The piston chamber/wall logic already stops the solid piston at the
-  coil cell, so the magnet sweeps `|Δ|` from ~1.5 down to ~0.5 — squarely within
-  the Gaussian — before contact. (Strong coupling region; tune σ.)
+- The edge's `g_e = 1/Re` stays in `Ga` — the source and its internal
+  resistance share the edge, exactly like a battery's `g_int` + `I_n`, and
+  the back-EMF/current limiting then **emerges from the solve** (no special
+  motor formula).
+- `E_e` uses the body velocity from the **previous** air step (one-frame lag,
+  same as the draft's ordering note; stable, and the field already relaxes
+  over many frames). `E_e` is recomputed every frame while any magnet moves;
+  `fieldV` is warm-started so nothing pops.
+- When a magnet moves, `fieldSimulate()` is re-run (it must be, because the
+  Case A bridge edge moves); N=961 so it is cheap. If no magnet moved, reuse
+  the previous systems.
 
----
+### 6.4 Case A armature edge
 
-## 5. Electric integration (`js/electric.js`, FIELD engine only)
+While a body with a Case-A bridge is present (`axis ≠ moveAxis`), the generic
+edge between its two pole cells gets `Re = R_arm` (instead of `R_wire+R_wire`).
+Implement as a small `edgeR(u,v)` override consulted by `gOf`/heat:
+```
+if (bridgeEdge.has(min:max)) return b.R_arm;
+```
+The bridge edge is a *normal* conductor edge — current through the body is
+solved for, its `I²R` heat is counted, and it magnetically couples to *other*
+magnets (it is not excluded from their kernels — only from its own body's).
 
-1. `fieldSimulate()`:
-   - Add `fieldCoilByIdx = new Map(solenoids.map(c=>[c.idx,c]))`.
-   - `cellR`: coil cell returns `c.limited ? c.R : R_wire` (same pattern as pump).
-   - Coil is a component member (conductor) — no forbidden edge needed (it is a
-     single cell, unlike a 1×2 battery).
-   - When building each battery-fed component's relaxation system, ALSO include
-     generator coils that belong to the component as **Norton sources**:
-     for each active generator coil compute `EMF = Kc·magStrength·Σ φ′(Δ)·v`
-     (sum over magnet pistons on its line), `I_n = EMF/c.R`, add internal
-     conductance edge between its two terminals `g_c=1/c.R`, and inject
-     `+winding·I_n` / `−winding·I_n`. Coil-only components (no battery, but a
-     closed loop with a load) also need to form a relaxation **system**: extend
-     the "one system per source component" pass to treat a generator coil with a
-     closed external loop as a source root (ground its − terminal).
-   - Important: `EMF` depends on piston velocity which is produced by the AIR
-     step. Read piston `vel`/`pos` as of the previous frame (coupling is one
-     frame lagged — stable, and the field already relaxes over many frames).
-2. `fieldPublish()`:
-   - Reset coil readouts; for each coil in a component compute terminal `dV`
-     (same two-neighbour readout as pump), `lastCurrent = dV/c.R`,
-     `lastPower = dV²/c.R` (Joule draw for actuator/load), and
-     `lastEMF` (generator open-voltage estimate). GODMODE coils are free
-     (`lastPower` not drawn from any battery) but still produce force/EMF.
-3. `computeHeatSource()`: add `cellR` coil branch (`r = c.limited ? c.R : R_wire`)
-   so Joule heat flows; then add explicit waste heat
-   `for (const c of solenoids) if (c.lastHeat) heatSource[c.idx] += c.lastHeat;`
-   mirroring the pump line.
+### 6.5 Self-exclusion (no fictitious self-force)
 
-Pump readout/heat sites are the exact templates to copy.
+For magnet `b`, edges that belong to the body itself (the Case-A bridge and
+any conductor cell the body overlaps) are excluded from `Bz_b` and `F_b` —
+a conductor cannot exert a net force on itself. The corresponding
+back-EMF contributions are symmetric about the moving body and integrate to
+~0 (soft core), so energy is unaffected; still exclude them from `E_e,b` for
+symmetry and robustness.
 
----
+### 6.6 `fieldPublish()` — B, force, readouts, heat
 
-## 6. Mechanical / air integration (`js/air.js`)
+After relaxation (currents now known):
 
-In the piston loop `(3.5)`, after computing `F_press` and friction, add:
+```
+for each system edge: I_e = (V[a] − V[b] + E_e) / Re(e)
+for each magnet b:
+  Bz_b = K_B Σ_e I_e · g_e(x_b)                     // self edges excluded
+  ∇Bz_b = K_B Σ_e I_e · ∇g_e(x_b)                   // analytic gradient
+  F_b = m_b · (∇Bz_b · â_b)                         // axial projection
+  b.lastBz = Bz_b; b.lastFcoil = F_b
+  b.lastPower = Σ_e E_e,b · I_e                     // >0 generator, <0 motor
+  b.lastCurrent = Case A ? bridge current : max|I_e| over coupled edges (loop current)
+  b.lastEMF = b.lastPower / max(|b.lastCurrent|,ε)  // signed equivalent EMF (V)
+  b.lastHeat = (Σ_e E_e,b·I_e)·(1−η) + I_bridge²·R_arm
+```
 
-1. **Coil force + spring** for magnet pistons:
-   ```
-   let F_coil = 0;
-   if (p.magnet) {
-     F_coil += -p.kSpring*(p.pos - p.restPos);            // centering spring
-     for (const c of solenoids) {
-       if (!sameTubeLine(p,c)) continue;
-       const d = axialGap(p,c);                           // signed Δ (§3.1)
-       const phip = -(d/SIGMA2)*Math.exp(-d*d/(2*SIGMA2));// φ′
-       const I = c.lastCurrent || 0;                      // from field solve
-       F_coil += p.magStrength * c.Kc * phip * I;         // actuator push/pull
-     }
-   }
-   p.lastFcoil = F_coil;
-   F_net = F_press + F_fric(...) + F_coil;
-   ```
-   Keep the existing static-lock test (use `|F_press + F_coil|` vs `F_static`)
-   and the ±6 velocity clamp and wall clamp. Coil cells are added to every
-   `pumps.some(pmp=>pmp.idx===idx)` wall/obstacle test so a magnet stops at a
-   coil just like at a pump/wall.
-2. `isAir()`: exclude coil cells (like pumps).
-3. `syncPistonOccupancy()` unchanged (already generic over `pistons`).
-4. `heatAirActive()`: add `|| solenoids.length > 0`.
+Then in `computeHeatSource()`:
 
-No change to the chamber redistribution — the coil is a fixed wall boundary like
-a pump, already handled by the wall clamping.
+- Per-edge Joule heat for the magnet-induced currents is **already computed by
+  the existing generic loop** (`P = dV²/Re` from `heatR`) — update its `dV`
+  to the EMF-aware `V[a]−V[b]+E_e` so generator currents heat the wires
+  correctly.
+- Add `b.lastHeat` to the body's two cells (mirror the pump line).
+- GODMODE: no battery draw changes; magnet coupling and heat stay physical.
 
-**Ordering note:** electric (`fieldRelax/publish`, producing `lastCurrent`) runs
-before air in the unified tick, or the coil uses last frame's current. Confirm
-the tick order in `ui.js`/`electric.js` sim loop and, if air runs first, just use
-the previous frame's `lastCurrent` (one-frame lag, stable).
+### 6.7 Loop gating
+
+`electricActive()`: add `|| bodies.some(b => b.magnet)` so a live magnet keeps
+the unified loop running (it must, to inject EMF and read force).
 
 ---
 
-## 7. Rendering (`js/render.js`)
+## 7. Mechanical / air integration (`js/air.js`)
 
-- `drawSolenoid(c)`: draw a coil cell — a sealed block (like pump body) wrapped
-  with a copper-coil motif (stacked arcs / a solenoid helix in `#d97706`), plus a
-  small `+ / −` polarity tick on the two terminal neighbours and a direction/
-  winding marker. Energised coils glow (use `energized.has(idx)` / `c.lastPower`).
-- Magnet piston: when `p.magnet`, render the classic gold/amber striped magnet
-  (as in the sketch) with red `+`/blue `−` pole caps on the two ends; non-magnet
-  pistons keep the current blue/steel look. Add a small force arrow for
-  `lastFcoil` (yellow) similar to the existing velocity arrow.
-- Call `solenoids.forEach(drawSolenoid)` next to `pumps.forEach(drawPump)`.
-- Property binder maps (already keyed by kind): add `solenoid:` rows for
-  R (Ω), efficiency (%), Kc / turns, winding (±), axis; and piston rows for
-  magnet (checkbox), magStrength, kSpring.
+Unchanged from Rev 2 except the force source:
 
----
-
-## 8. UI (`js/ui.js` + `index.html`)
-
-- GOD item + inventory row `solenoid`; `placeSolenoid(idx)` / `returnSolenoid(c)`
-  cloned from pump placement (corridor cell, not on battery pole, wirePassable,
-  wire-cut → junction like pump, inventory decrement, select-on-reclick).
-- Eraser, pickUnder, double-click select, scene clear/reset lists: add solenoids
-  alongside pumps at every site.
-- `index.html`:
-  - `<template id="prop-tpl-solenoid">` (R, efficiency, Kc/turns, winding flip,
-    axis) and piston template gets magnet checkbox + magStrength + kSpring.
-  - Scene button row already has "Piston & Pump"; add a **"Solenoid Lab"** scene.
-- GUI must show (per the project's "show the physics" convention): coil current,
-  EMF, force on magnet, and piston friction/spring.
+- Piston loop iterates `bodies`; after `F_press`/friction:
+  ```
+  F_coil = b.lastFcoil || 0          // published by fieldPublish this frame
+  F_net  = F_press + F_fric(...) + F_coil
+  ```
+  Static lock uses `|F_press + F_coil|`; ±6 clamp and wall clamp unchanged.
+- Mode A cross-axis chamber (2-row carriage): occupancy, `getChamber`,
+  `faceBlocked` generalized over `(axis, moveAxis)`; `axis===moveAxis` reduces
+  to today's code bit-for-bit.
+- `isAir`/`syncPistonOccupancy`/`heatAirActive`: `bodies` in place of
+  `pistons`; coil/wire/metal cells are **never** air obstacles (a magnet is
+  hermetic, a wire is not a wall).
+- **No spring on the body** (deferred, §11).
 
 ---
 
-## 9. New preset scene: "solenoid-lab"
+## 8. Gas engine: real work + temperature change
 
-Two rigs in one maze (mirrors the sketch):
+(Unchanged from Rev 2 — the field model does not affect it.)
 
-- **Rig A — generator:** air pump pressurises a tube → magnet piston slides
-  through a coil → coil wired to a lamp (and optional meter). Moving magnet lights
-  the lamp (motion → electricity). Spring returns the magnet; opening a valve
-  cycles it. Demonstrates effects **1 → 2**.
-- **Rig B — actuator/motor:** battery + switch + coil wrapped around a tube with
-  a magnet piston; closing the switch drives current → Lorentz force yanks/pushes
-  the piston, compressing the spring and pushing air (pressure gauge / particles
-  at the far end). Demonstrates effect **3** (and back-pressure).
-
-Wire both coils into the manual-wire / field network the same way the pump scene
-wires its pump (`js/ui.js` scene loader around line 202 is the template).
-
----
-
-## 10. Tests (`js/test_solenoid.js`, new; headless VM loader copied from test_piston_pump.js)
-
-1. **dirs/PUMP_DIRS ordering** unchanged (0=N,1=E,2=S,3=W) and solenoid axis/dir
-   tables match.
-2. **Coil is sealed to air but conductive:** `isAir(coilIdx)===false`; piston
-   wall-clamp treats coil as obstacle; `cellR(coilIdx)` finite.
-3. **Generator EMF sign & magnitude:** move a magnet piston through a coil at
-   known `v`; assert `|EMF|` peaks near `Δ≈σ`, flips sign before vs after
-   centring, and is ~0 when `v=0`; assert a wired lamp receives `dV > DV_LIT`
-   and `lastPower > 0`.
-4. **Lenz drag opposes motion:** with a loaded coil, piston decelerates faster
-   than with open coil (mechanical energy removed); total energy (mech + Joule)
-   conserved to tolerance.
-5. **Actuator force:** energised coil (battery loop) with stationary magnet
-   offset at `Δ≈σ` produces `|F_coil|` in the expected direction; reversing
-   winding/current reverses force; magnet accelerates from rest.
-6. **Reciprocity/energy:** same `Kc, φ′` used both ways — assert
-   `F_coil·v ≈ EMF·I` over a glide (energy bookkeeping closes).
-7. **Spring return:** de-energised actuator magnet returns toward `restPos`
-   (damped) and settles; pressure can still overcome spring (terminal speed in
-   0.1–5 cells/s range).
-8. **Jitter regression:** magnet piston gliding through a coil shows **0
-   per-frame velocity reversals** (extend Test 9 of the piston suite).
-9. **Waste heat:** powered coil raises `heatSource[coilIdx]`; GODMODE coil draws
-   no battery energy but still couples.
-10. **Scene smoke test:** `solenoid-lab` loads with expected counts (coils,
-    magnet pistons, battery, switch, lamp, pump) and no exceptions.
-
-Run: `node js/test_solenoid.js`. Target: all pass; keep `test_piston_pump.js`
-(35) and `test_electric_demo.js` (17) green.
+- Switch energy bookkeeping to `AIR_CV = AIR_CP − R_SPEC` (≈718 J/kg·K,
+  γ≈1.40); all `T↔U` conversions use `cv`.
+- Advect **enthalpy** `h = u + P/ρ = cp·T` with mass flux (flow work is
+  accounted where gas crosses faces; pump/source/sink lines updated).
+- Piston P–V work each move:
+  ```
+  dV = (newPos − pos)·A
+  uRear  −= pBack·dV       // expansion does work on gas (gas cools)
+  uFront += pFront·dV      // compression work done on gas (gas heats)
+  ```
+  then the existing proportional redistribution. Clamp `u ≥ 0`; apply only
+  when `|dPos| > 1e-7`. **Never** add the work term as a force (no feedback
+  into `F_net`) — heat only, so the jitter regression stays green.
+- Verify: closed adiabatic chamber satisfies `P·V^γ ≈ const`; compression
+  heats, expansion cools; no-heat/no-friction piston conserves
+  `U + ½mv²`.
 
 ---
 
-## 11. Calibration targets
+## 9. Rendering (`js/render.js`)
 
-- `Kc` default such that a magnet at piston terminal speed (~1–2 cells/s) through
-  a coil produces a few volts (enough to light a lamp through the field network),
-  and a battery-driven coil yields `F_coil` of the same order as pressure forces
-  (tens–low-hundreds of N) so motion is visible but friction (10–100 N) is not
-  trivially overwhelmed.
-- σ ≈ 0.7–1.0 cell so the coupling is smooth across the integer-cell boundary
-  (the whole reason the chamber model exists) — no per-frame force spikes.
-- Expose Kc, turns (maps to Kc), R, efficiency, winding, kSpring as sliders so
-  numbers can be tuned live.
+- **Magnet body**: gold/amber with red `+` / blue `−` rail-contact caps on the
+  ends (Case A) and a ⊙/⊗ symbol for the moment `m` (out of/into board);
+  plain pistons unchanged. Case A draws the perpendicular orientation.
+- **Field overlay** (the "show the physics" convention): draw `Bz` as a
+  subtle blue/red tint over conductor cells (or a `Bz` view mode), plus small
+  current arrows on every edge from `I_e` — the user can *see* that force
+  comes from actual currents, and verify the hand rule by eye.
+- **Force arrow** for `lastFcoil` (amber) beside the velocity arrow; a small
+  `Bz`/EMF/current readout on selection.
+- `bodies.forEach(drawBody)`; property binder rows for magnet (checkbox),
+  magStrength (± slider), `R_arm`, efficiency, friction/damping/mass (shared
+  `prop-tpl-body`), readouts.
 
 ---
 
-## 12. Milestones (ship order)
+## 10. UI + demo scene
 
-1. **M1 – State + placement + render + property panels** for a coil and a
-   magnet-flagged piston (no physics yet); coil sealed-to-air/conductive;
-   scene loads. (Test 1,2,10-partial.)
-2. **M2 – Actuator (effect 3):** field current → Lorentz force on magnet + spring
-   + waste heat; "solenoid-lab" Rig B. (Tests 5,7,9.)
-3. **M3 – Generator (effect 2):** motion → Norton EMF injection (new source-root
-   component) → lamp lights; Lenz drag; Rig A. (Tests 3,4,6.)
-4. **M4 – Polish:** jitter regression through coil, energy audit, GUI readouts,
-   full scene + all suites green. (Test 8 + full pass.)
+- `solenoid` = "Magnet Piston" inventory/GOD item; placement A/B by corridor
+  shape + conductor presence; eraser/pick/clear/reset alongside pistons.
+- Wire + metal tools unchanged — conductors are built with existing tools.
+- `index.html`: `prop-tpl-solenoid`, shared `prop-tpl-body`, scene button
+  **"Solenoid Lab"**.
+- GUI readouts: `Bz` at magnet, `E_e·I_e` total (signed), armature current,
+  force, waste heat.
 
-Each milestone is independently runnable from `file://` and keeps the existing
-piston/pump/electric suites passing.
+**Scene `solenoid-lab`** (draft's test: gas moves magnet → wires produce
+electricity → electricity moves another magnet):
+
+```
+Rig A (generator):  air source + valve → tube → magnet piston (Case B)
+                    → rails → wires ─────────┐
+                                            │ one wire network
+Rig B (motor):      magnet piston (Case A) ←─┘ ← rails + battery + switch
+                    → tube with valve (pressure gauge at the far end)
+```
+
+Gas moves Rig A's magnet → currents are induced in the loop → Rig B's magnet
+is pushed → air moves at Rig B's end. Fully closed energy chain
+(gas → electricity → gas), measurable with the audit readouts. A third,
+optional rig shows a **single energized wire** pushing a magnet (the simplest
+possible "coil").
+
+---
+
+## 11. Deferred: return spring (separate object)
+
+Unchanged from Rev 2: a free-standing 1×2 object (stopper cell + spring cell,
+air passes through, force `−k(x−rest)` on any pressing piston), placeable
+anywhere, independent of the magnet body. Not part of `createMechanicalBody`.
+
+---
+
+## 12. Tests (`js/test_solenoid.js`, new; headless VM loader from
+`test_piston_pump.js`)
+
+1. **dirs ordering** unchanged; edge orientation / kernel cross-product match
+   `dirs` for `±x` and `±y` edges.
+2. **Body factory/composition**: piston vs solenoid share fields; Mode A body
+   has `axis ≠ moveAxis`; plain piston default unchanged; hermetic cross-axis
+   chamber conserves mass and seals both rows (no leak).
+3. **Field from a single wire:** one battery + one straight wire; magnet
+   beside it feels `F` toward/away from the wire per polarity; no current →
+   `Bz = 0, F = 0`; reversing current reverses `Bz` and `F`.
+4. **Rails/loop (solenoid):** two opposite-current rails → `Bz` strong and
+   near-uniform between them; magnet at the end is pulled toward the middle;
+   at center `∇Bz ≈ 0`. Works for wire rails **and** painted metal rails and
+   mixed.
+5. **Arbitrary geometry (no pattern matching):** an L-shaped wire run, a
+   zig-zag loop, a wide metal sheet with a diagonal-ish current path — each
+   produces a well-defined `Bz`/`F` via the kernel (asserts against the
+   analytic sum, not against a "coil" shape).
+6. **Case A:** body on rails, open rail ends: battery → rails → bridge →
+   battery is a closed circuit; current flows through the bridge; force from
+   rail field per hand rule; open battery → no current → no force.
+7. **Case B:** body between rails, loop closed elsewhere: gas pushes body →
+   lamp in the loop receives `dV > DV_LIT`, `lastPower > 0`; open the loop →
+   no current, no force, no lamp.
+8. **Back-EMF:** battery-driven motor: `|I_coil|` falls as `|v|` rises and
+   approaches zero at no-load speed; motor input power ≥ mechanical output.
+9. **Lenz drag:** closed loop + moving magnet decelerates faster than open
+   loop (energy audit: Δmech + Δelec + Joule + waste closes to tolerance).
+10. **Energy identity:** `Σ E_e I_e + Σ F_b v_b ≈ 0` every frame (round-off),
+    for single wire, rails, floor, Case A, Case B, and the two-magnet scene.
+11. **Metal floor:** painted metal rails/sheet behave identically; magnet
+    moving over a metal sheet with a closed external loop induces distributed
+    currents and drag.
+12. **Waste heat:** `heatSource` rises on the body cells and on the wires
+    carrying induced currents; GODMODE magnet couples without battery drain.
+13. **Gas work:** adiabatic compression heats (`T↑`, `P·V^γ ≈ const`);
+    expansion cools; `ΔU ≈ ∫P dV`; enthalpy advection conserves energy.
+14. **Jitter regression:** magnet gliding over/through any conductor shows 0
+    per-frame velocity reversals (extends the piston suite's test 9).
+15. **Scene smoke test:** `solenoid-lab` loads, expected counts, no exceptions.
+
+Run: `node js/test_solenoid.js`; keep `test_piston_pump.js` (35) and
+`test_electric_demo.js` (17) green.
+
+---
+
+## 13. Calibration targets
+
+- `K_B` such that: a magnet at 1–2 cells/s induces a few volts across a
+  1-cell-long rail pair (lamp lights); a battery-driven rail pair yields
+  `F` of tens–low hundreds of N (visible, but friction 10–100 N is not
+  trivially overwhelmed).
+- `σ_B ≈ 0.5 cell` soft core, `r_max ≈ 8 cells` cutoff. Kernel smoothness is
+  the jitter guarantee — no per-frame force steps anywhere.
+- `magStrength` default ±1 (slider 0.2–5), `R_arm` 2 Ω, `η` 0.85; expose
+  `K_B, magStrength, R_arm, η, σ_B` as sliders.
+- Case A: a short fed rail span moves the carriage at ~0.1–5 cells/s;
+  Case B generator: lamp lights and the magnet visibly decelerates.
+
+---
+
+## 14. Milestones (ship order)
+
+1. **M1 – Mechanical body refactor:** `createMechanicalBody()`, `bodies[]`,
+   Mode A cross-axis chamber, render both orientations; all existing suites
+   green. (Tests 1, 2.)
+2. **M2 – Field core:** per-edge current registry, `Bz`/`∇Bz` kernel, magnet
+   force, Case A armature bridge (edge R override), readouts + `Bz` view.
+   (Tests 3, 4, 5, 6.)
+3. **M3 – Back-EMF + generators:** per-edge Norton EMF injection, source-root
+   systems without batteries, Lenz drag, lamp lights, Case B rig, full
+   `solenoid-lab` network. (Tests 7, 8, 9, 10, 11, 15.)
+4. **M4 – Gas work:** cv/enthalpy + piston P–V work, comp/expansion
+   temperature, energy audit, jitter regression. (Tests 12–14.)
+5. **M5 (deferred) – Spring object** per §11.
+
+Each milestone runs from `file://` and keeps the existing suites passing.
