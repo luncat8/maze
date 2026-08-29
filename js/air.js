@@ -237,16 +237,17 @@ function airRelax(sweeps, dt) {
 			airN[s.idx] -= dm;
 			airU[s.idx] -= f * airU[s.idx];
 		}
-		// (3.5) PISTON DYNAMICS & WALL CLAMPING
+		
+		// (3.5) PISTON DYNAMICS & CONTINUOUS CHAMBER-COUPLED MOVING BOUNDARY
 		for (let k = 0; k < pistons.length; k++) {
 			const p = pistons[k];
 			const mass = p.mass || 100;
 			const friction = p.friction != null ? p.friction : 50;
 			const damping = p.damping || 200;
 
-			let pBack = pAmb, pFront = pAmb;
-			let minPos = 0, maxPos = GRID_W - 2;
-			if (p.axis === 'h') {
+			let minPos = 0, maxPos = (p.axis === "h" ? GRID_W : GRID_H) - 2;
+
+			if (p.axis === "h") {
 				const y = p.y;
 				const curLeft = Math.floor(p.pos);
 				const curRight = Math.floor(p.pos + 2.0);
@@ -258,18 +259,10 @@ function airRelax(sweeps, dt) {
 					const idx = y * GRID_W + x;
 					if (grid[idx] !== 0 || blocked[idx] || pumps.some(pmp => pmp.idx === idx)) { maxPos = x - 2; break; }
 				}
-				let backX = Math.max(0, Math.floor(p.pos));
-				if (airVol[y * GRID_W + backX] < 0.15 * CELL_VOL && backX > 0) backX--;
-				let frontX = Math.min(GRID_W - 1, Math.floor(p.pos + 2.0));
-				if (airVol[y * GRID_W + frontX] < 0.15 * CELL_VOL && frontX < GRID_W - 1) frontX++;
-				const bIdx = y * GRID_W + backX, fIdx = y * GRID_W + frontX;
-				pBack = isAir(bIdx) ? pOf(airN[bIdx], airU[bIdx], airVol[bIdx]) : pAmb;
-				pFront = isAir(fIdx) ? pOf(airN[fIdx], airU[fIdx], airVol[fIdx]) : pAmb;
 			} else {
 				const x = p.x;
 				const curTop = Math.floor(p.pos);
 				const curBot = Math.floor(p.pos + 2.0);
-				minPos = 0; maxPos = GRID_H - 2;
 				for (let y = curTop; y >= 0; y--) {
 					const idx = y * GRID_W + x;
 					if (grid[idx] !== 0 || blocked[idx] || pumps.some(pmp => pmp.idx === idx)) { minPos = y + 1; break; }
@@ -278,20 +271,82 @@ function airRelax(sweeps, dt) {
 					const idx = y * GRID_W + x;
 					if (grid[idx] !== 0 || blocked[idx] || pumps.some(pmp => pmp.idx === idx)) { maxPos = y - 2; break; }
 				}
-				let backY = Math.max(0, Math.floor(p.pos));
-				if (airVol[backY * GRID_W + x] < 0.15 * CELL_VOL && backY > 0) backY--;
-				let frontY = Math.min(GRID_H - 1, Math.floor(p.pos + 2.0));
-				if (airVol[frontY * GRID_W + x] < 0.15 * CELL_VOL && frontY < GRID_H - 1) frontY++;
-				const bIdx = backY * GRID_W + x, fIdx = frontY * GRID_W + x;
-				pBack = isAir(bIdx) ? pOf(airN[bIdx], airU[bIdx], airVol[bIdx]) : pAmb;
-				pFront = isAir(fIdx) ? pOf(airN[fIdx], airU[fIdx], airVol[fIdx]) : pAmb;
 			}
-			const F_press = (pBack - pFront) * 1.0; // A = 1 m^2
+
+			// Helper to get chamber properties along corridor
+			function getChamber(X0, X1) {
+				let mR = 0, uR = 0, vR = 0;
+				let mF = 0, uF = 0, vF = 0;
+				const rCells = [], fCells = [];
+				const rVols = [], fVols = [];
+
+				if (p.axis === "h") {
+					const y = p.y;
+					for (let x = minPos; x <= Math.floor(X0); x++) {
+						const idx = y * GRID_W + x;
+						if (grid[idx] === 0) {
+							const v = x < Math.floor(X0) ? CELL_VOL : Math.max(0, (X0 - x) * CELL_VOL);
+							if (v > 1e-5 || x < Math.floor(X0)) {
+								rCells.push(idx); rVols.push(v);
+								mR += airN[idx]; uR += airU[idx]; vR += v;
+							}
+						}
+					}
+					const endX = Math.min(GRID_W - 1, maxPos + 1);
+					for (let x = Math.floor(X1); x <= endX; x++) {
+						const idx = y * GRID_W + x;
+						if (grid[idx] === 0) {
+							const v = x > Math.floor(X1) ? CELL_VOL : Math.max(0, (x + 1.0 - X1) * CELL_VOL);
+							if (v > 1e-5 || x > Math.floor(X1)) {
+								fCells.push(idx); fVols.push(v);
+								mF += airN[idx]; uF += airU[idx]; vF += v;
+							}
+						}
+					}
+				} else {
+					const x = p.x;
+					for (let y = minPos; y <= Math.floor(X0); y++) {
+						const idx = y * GRID_W + x;
+						if (grid[idx] === 0) {
+							const v = y < Math.floor(X0) ? CELL_VOL : Math.max(0, (X0 - y) * CELL_VOL);
+							if (v > 1e-5 || y < Math.floor(X0)) {
+								rCells.push(idx); rVols.push(v);
+								mR += airN[idx]; uR += airU[idx]; vR += v;
+							}
+						}
+					}
+					const endY = Math.min(GRID_H - 1, maxPos + 1);
+					for (let y = Math.floor(X1); y <= endY; y++) {
+						const idx = y * GRID_W + x;
+						if (grid[idx] === 0) {
+							const v = y > Math.floor(X1) ? CELL_VOL : Math.max(0, (y + 1.0 - X1) * CELL_VOL);
+							if (v > 1e-5 || y > Math.floor(X1)) {
+								fCells.push(idx); fVols.push(v);
+								mF += airN[idx]; uF += airU[idx]; vF += v;
+							}
+						}
+					}
+				}
+				return { mR, uR, vR, rCells, rVols, mF, uF, vF, fCells, fVols };
+			}
+
+			const ch = getChamber(p.pos, p.pos + 2.0);
+
+			let pBack = pAmb, pFront = pAmb;
+			if (ch.vR >= 0.15 * CELL_VOL && ch.mR > N_MIN) {
+				const tRear = ch.uR / (ch.mR * AIR_CP);
+				pBack = (ch.mR / ch.vR) * R_SPEC * (T_AMB + tRear) * P_SCALE;
+			}
+			if (ch.vF >= 0.15 * CELL_VOL && ch.mF > N_MIN) {
+				const tFront = ch.uF / (ch.mF * AIR_CP);
+				pFront = (ch.mF / ch.vF) * R_SPEC * (T_AMB + tFront) * P_SCALE;
+			}
+
+			const F_press = (pBack - pFront) * 1.0;
 			p.lastFpress = F_press;
 
 			const F_static = 1.2 * friction;
-			let F_fric = 0;
-			let F_net = 0;
+			let F_fric = 0, F_net = 0;
 			if (Math.abs(p.vel) < 1e-4) {
 				if (Math.abs(F_press) <= F_static) {
 					p.vel = 0;
@@ -324,135 +379,31 @@ function airRelax(sweeps, dt) {
 				p.blockedWall = false;
 			}
 
-			// ALE moving boundary displacement: sweep mass into forward/backward cells
 			const dPos = newPos - p.pos;
 			if (Math.abs(dPos) > 1e-7) {
-				const nextVol = airVol.slice();
-				if (p.axis === 'h') {
-					const y = p.y;
-					const p0 = newPos, p1 = newPos + 2.0;
-					const minX = Math.max(0, Math.floor(Math.min(p.pos, newPos)));
-					const maxX = Math.min(GRID_W - 1, Math.floor(Math.max(p.pos, newPos) + 2.0));
-					for (let x = minX; x <= maxX; x++) {
-						const overlap = Math.max(0, Math.min(x + 1.0, p1) - Math.max(x + 0.0, p0));
-						nextVol[y * GRID_W + x] = Math.max(1e-3, (1.0 - Math.min(1.0, overlap)) * CELL_VOL);
-					}
-					if (dPos > 0) {
-						for (let x = maxX; x >= minX; x--) {
-							const idx = y * GRID_W + x;
-							const dV = nextVol[idx] - airVol[idx];
-							if (dV < -1e-7 && x + 1 < GRID_W && isAir(y * GRID_W + (x + 1))) {
-								const nxt = y * GRID_W + (x + 1);
-								const rho = airN[idx] / Math.max(1e-3, airVol[idx]);
-								const dm = Math.min(airN[idx], rho * (-dV));
-								const e = airN[idx] > N_MIN ? airU[idx] / airN[idx] : 0;
-								airN[idx] -= dm; airN[nxt] += dm;
-								airU[idx] -= dm * e; airU[nxt] += dm * e;
-							}
-						}
-						for (let x = minX; x <= maxX; x++) {
-							const idx = y * GRID_W + x;
-							const dV = nextVol[idx] - airVol[idx];
-							if (dV > 1e-7 && x - 1 >= 0 && isAir(y * GRID_W + (x - 1))) {
-								const prv = y * GRID_W + (x - 1);
-								const rho = airN[prv] / Math.max(1e-3, airVol[prv]);
-								const dm = Math.min(airN[prv], rho * dV);
-								const e = airN[prv] > N_MIN ? airU[prv] / airN[prv] : 0;
-								airN[prv] -= dm; airN[idx] += dm;
-								airU[prv] -= dm * e; airU[idx] += dm * e;
-							}
-						}
-					} else {
-						for (let x = minX; x <= maxX; x++) {
-							const idx = y * GRID_W + x;
-							const dV = nextVol[idx] - airVol[idx];
-							if (dV < -1e-7 && x - 1 >= 0 && isAir(y * GRID_W + (x - 1))) {
-								const prv = y * GRID_W + (x - 1);
-								const rho = airN[idx] / Math.max(1e-3, airVol[idx]);
-								const dm = Math.min(airN[idx], rho * (-dV));
-								const e = airN[idx] > N_MIN ? airU[idx] / airN[idx] : 0;
-								airN[idx] -= dm; airN[prv] += dm;
-								airU[idx] -= dm * e; airU[prv] += dm * e;
-							}
-						}
-						for (let x = maxX; x >= minX; x--) {
-							const idx = y * GRID_W + x;
-							const dV = nextVol[idx] - airVol[idx];
-							if (dV > 1e-7 && x + 1 < GRID_W && isAir(y * GRID_W + (x + 1))) {
-								const nxt = y * GRID_W + (x + 1);
-								const rho = airN[nxt] / Math.max(1e-3, airVol[nxt]);
-								const dm = Math.min(airN[nxt], rho * dV);
-								const e = airN[nxt] > N_MIN ? airU[nxt] / airN[nxt] : 0;
-								airN[nxt] -= dm; airN[idx] += dm;
-								airU[nxt] -= dm * e; airU[idx] += dm * e;
-							}
-						}
-					}
-				} else {
-					const x = p.x;
-					const p0 = newPos, p1 = newPos + 2.0;
-					const minY = Math.max(0, Math.floor(Math.min(p.pos, newPos)));
-					const maxY = Math.min(GRID_H - 1, Math.floor(Math.max(p.pos, newPos) + 2.0));
-					for (let y = minY; y <= maxY; y++) {
-						const overlap = Math.max(0, Math.min(y + 1.0, p1) - Math.max(y + 0.0, p0));
-						nextVol[y * GRID_W + x] = Math.max(1e-3, (1.0 - Math.min(1.0, overlap)) * CELL_VOL);
-					}
-					if (dPos > 0) {
-						for (let y = maxY; y >= minY; y--) {
-							const idx = y * GRID_W + x;
-							const dV = nextVol[idx] - airVol[idx];
-							if (dV < -1e-7 && y + 1 < GRID_H && isAir((y + 1) * GRID_W + x)) {
-								const nxt = (y + 1) * GRID_W + x;
-								const rho = airN[idx] / Math.max(1e-3, airVol[idx]);
-								const dm = Math.min(airN[idx], rho * (-dV));
-								const e = airN[idx] > N_MIN ? airU[idx] / airN[idx] : 0;
-								airN[idx] -= dm; airN[nxt] += dm;
-								airU[idx] -= dm * e; airU[nxt] += dm * e;
-							}
-						}
-						for (let y = minY; y <= maxY; y++) {
-							const idx = y * GRID_W + x;
-							const dV = nextVol[idx] - airVol[idx];
-							if (dV > 1e-7 && y - 1 >= 0 && isAir((y - 1) * GRID_W + x)) {
-								const prv = (y - 1) * GRID_W + x;
-								const rho = airN[prv] / Math.max(1e-3, airVol[prv]);
-								const dm = Math.min(airN[prv], rho * dV);
-								const e = airN[prv] > N_MIN ? airU[prv] / airN[prv] : 0;
-								airN[prv] -= dm; airN[idx] += dm;
-								airU[prv] -= dm * e; airU[idx] += dm * e;
-							}
-						}
-					} else {
-						for (let y = minY; y <= maxY; y++) {
-							const idx = y * GRID_W + x;
-							const dV = nextVol[idx] - airVol[idx];
-							if (dV < -1e-7 && y - 1 >= 0 && isAir((y - 1) * GRID_W + x)) {
-								const prv = (y - 1) * GRID_W + x;
-								const rho = airN[idx] / Math.max(1e-3, airVol[idx]);
-								const dm = Math.min(airN[idx], rho * (-dV));
-								const e = airN[idx] > N_MIN ? airU[idx] / airN[idx] : 0;
-								airN[idx] -= dm; airN[prv] += dm;
-								airU[idx] -= dm * e; airU[prv] += dm * e;
-							}
-						}
-						for (let y = maxY; y >= minY; y--) {
-							const idx = y * GRID_W + x;
-							const dV = nextVol[idx] - airVol[idx];
-							if (dV > 1e-7 && y + 1 < GRID_H && isAir((y + 1) * GRID_W + x)) {
-								const nxt = (y + 1) * GRID_W + x;
-								const rho = airN[nxt] / Math.max(1e-3, airVol[nxt]);
-								const dm = Math.min(airN[nxt], rho * dV);
-								const e = airN[nxt] > N_MIN ? airU[nxt] / airN[nxt] : 0;
-								airN[nxt] -= dm; airN[idx] += dm;
-								airU[nxt] -= dm * e; airU[idx] += dm * e;
-							}
-						}
+				p.pos = newPos;
+				p.x = p.axis === "h" ? Math.round(newPos) : p.x;
+				p.y = p.axis === "v" ? Math.round(newPos) : p.y;
+				syncPistonOccupancy();
+
+				const chNew = getChamber(newPos, newPos + 2.0);
+
+				if (chNew.vR > 1e-4 && ch.mR > 0) {
+					for (let i = 0; i < chNew.rCells.length; i++) {
+						const idx = chNew.rCells[i];
+						const frac = chNew.rVols[i] / chNew.vR;
+						airN[idx] = ch.mR * frac;
+						airU[idx] = ch.uR * frac;
 					}
 				}
-				p.pos = newPos;
-				p.x = p.axis === 'h' ? Math.round(newPos) : p.x;
-				p.y = p.axis === 'v' ? Math.round(newPos) : p.y;
-				syncPistonOccupancy();
+				if (chNew.vF > 1e-4 && ch.mF > 0) {
+					for (let i = 0; i < chNew.fCells.length; i++) {
+						const idx = chNew.fCells[i];
+						const frac = chNew.fVols[i] / chNew.vF;
+						airN[idx] = ch.mF * frac;
+						airU[idx] = ch.uF * frac;
+					}
+				}
 			}
 		}
 		syncPistonOccupancy();

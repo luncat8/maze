@@ -327,6 +327,67 @@ const scenePiston = getRef('pistons')[0];
 assert(scenePump.lastPower > 1.0, `Pump is energized by battery circuit (power = ${scenePump.lastPower.toFixed(2)} W)`);
 assert(scenePiston.lastFpress > 0, `Piston experiences positive pressure drive from pump (F_press = ${scenePiston.lastFpress.toFixed(2)} N)`);
 
+// TEST 9: Smooth Glide & Zero-Jitter Stability (Continuous Pressure Drive)
+console.log('\n== Test 9: Smooth Glide & Zero-Jitter Velocity Stability ==');
+runCode(`
+grid.fill(1);
+for (let x = 0; x <= 25; x++) grid[15 * GRID_W + x] = 0;
+pistons.length = 0;
+seedAir();
+pistons.push({
+	id: 1, x: 8, y: 15, axis: 'h', pos: 8.0, vel: 0,
+	friction: 50, damping: 200, mass: 100, limited: false
+});
+syncPistonOccupancy();
+airSources.length = 0;
+airSources.push({ idx: 15 * GRID_W + 5, rate: 0.5, temp: T_AMB });
+
+dt = (1 / 60 * 10) / 24;
+let hReversals = 0;
+let prevHVel = 0;
+for (let f = 0; f < 45; f++) {
+	airRelax(24, dt);
+	const p = pistons[0];
+	if (f > 2 && Math.abs(p.vel) > 0.05 && Math.abs(prevHVel) > 0.05) {
+		if (Math.sign(p.vel) !== Math.sign(prevHVel)) hReversals++;
+	}
+	prevHVel = p.vel;
+}
+globalThis.__hPiston = { pos: pistons[0].pos, vel: pistons[0].vel, reversals: hReversals };
+`);
+const hData = sandbox.__hPiston;
+assert(hData.reversals === 0, `Horizontal piston glides without per-frame velocity reversals (got ${hData.reversals} reversals)`);
+assert(hData.pos > 9.0, `Horizontal piston smoothly advances past integer cell boundary (pos = ${hData.pos.toFixed(2)})`);
+
+runCode(`
+grid.fill(1);
+for (let y = 0; y <= 25; y++) grid[y * GRID_W + 15] = 0;
+pistons.length = 0;
+seedAir();
+pistons.push({
+	id: 1, x: 15, y: 8, axis: 'v', pos: 8.0, vel: 0,
+	friction: 50, damping: 200, mass: 100, limited: false
+});
+syncPistonOccupancy();
+airSources.length = 0;
+airSources.push({ idx: 5 * GRID_W + 15, rate: 0.5, temp: T_AMB });
+
+let vReversals = 0;
+let prevVVel = 0;
+for (let f = 0; f < 45; f++) {
+	airRelax(24, dt);
+	const p = pistons[0];
+	if (f > 2 && Math.abs(p.vel) > 0.05 && Math.abs(prevVVel) > 0.05) {
+		if (Math.sign(p.vel) !== Math.sign(prevVVel)) vReversals++;
+	}
+	prevVVel = p.vel;
+}
+globalThis.__vPiston = { pos: pistons[0].pos, vel: pistons[0].vel, reversals: vReversals };
+`);
+const vData = sandbox.__vPiston;
+assert(vData.reversals === 0, `Vertical piston glides without per-frame velocity reversals (got ${vData.reversals} reversals)`);
+assert(vData.pos > 9.0, `Vertical piston smoothly advances past integer cell boundary (pos = ${vData.pos.toFixed(2)})`);
+
 // ---------- Summary --------------------------------------------------------
 
 console.log(`\n=== RESULTS: ${passCount} pass, ${failCount} fail ===`);
