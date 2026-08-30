@@ -303,29 +303,32 @@ document.getElementById('clearBtn').onclick = () => {
 			if (pistons[1]) { pistons[1].friction = 20; }
 			logger('Scene: Solenoid Lab — gas drives the left magnet (generator); current in the loop pushes the right magnet (motor).', 'sys');
 		} else if (name === 'solenoid-loop') {
-			// Bidirectional electromechanical demo: a battery-fed rectangular wire
-			// loop (with a lamp load) wraps a 3-row chamber. A magnet piston
-			// (solenoid) sits inside the loop as a moving conductor/dipole:
-			//   - push it from the Air Source and it GENERATES (lamp lights, Lenz drag);
-			//   - drive the loop from the battery and it MOTORS (force on the magnet).
-			// One kernel (Biot–Savart) gives both directions; energy closes by
-			// construction (Σ E·I + F·v = 0).
+			// Generator demo: the Air Source pushes the magnet piston (solenoid)
+			// around a closed wire loop; the moving magnet induces an EMF that
+			// lights the lamp (Lenz drag).
 			const rc = (x, y) => y * GRID_W + x;
+			const row = (xa, xb, y) => { const a = []; for (let x = xa; x <= xb; x++) a.push(rc(x, y)); return a; };
+			const col = (x, ya, yb) => { const a = []; for (let y = ya; y <= yb; y++) a.push(rc(x, y)); return a; };
 			grid.fill(1);
-			for (let y = 14; y <= 16; y++)
-				for (let x = 4; x <= 26; x++) grid[y * GRID_W + x] = 0;
+			for (let y = 14; y <= 16; y++) for (let x = 4; x <= 26; x++) grid[rc(x, y)] = 0;
 			buildNetworks();
 			seedAir();
-			const sLoop = [];
-			for (let x = 6; x <= 24; x++) sLoop.push(rc(x, 14));        // top rail
-			for (let y = 15; y <= 16; y++) sLoop.push(rc(24, y));      // right rail
-			for (let x = 23; x >= 6; x--) sLoop.push(rc(x, 16));       // bottom rail
-			sLoop.push(rc(6, 15));                                     // left rail back
-			sceneAddWire(sLoop, '#f59e0b');
-			placeBattery(6, 14);
+			sceneAddWire(row(6, 14, 14), '#f59e0b');  // top-left rail (amber)
+			sceneAddWire(row(16, 26, 14), '#ff0000'); // top-right rail
+			sceneAddWire(col(26, 14, 16), '#ff0000'); // right return
+			sceneAddWire(row(6, 26, 16), '#ff0000');  // bottom rail
+			sceneAddWire(col(6, 14, 16), '#ff0000');  // left return
 			placeLamp(15, 14);
-			placeSolenoid(15, 15);
-			logger('Scene: Solenoid Loop — magnet piston in a wire loop. Push it (Air Source) to generate, or drive the loop (battery) to motor it.', 'sys');
+			const lp = lamps[lamps.length - 1];
+			if (lp) lp.energy = 2000;
+			placeSolenoid(7, 15);
+			const ms = pistons[pistons.length - 1];
+			if (ms) { ms.axis = 'h'; ms.moveAxis = 'h'; ms.pos = 7; ms.friction = 50; ms.magStrength = 1; ms.vel = -6; }
+			placeAirSource(5, 15);
+			const as = airSources[airSources.length - 1];
+			if (as) { as.rate = 0.35; as.temp = 293; }
+			setColorView('voltage');
+			logger('Scene: Solenoid Loop — the Air Source pushes the magnet piston around the wire loop; the moving magnet lights the lamp (Lenz drag).', 'sys');
 		} else if (name === 'bat-to-solenoid') {
 			// Battery → linear solenoid. A single battery feeds two parallel current
 			// rails that bound a horizontal air channel; the magnet piston (solenoid)
@@ -423,9 +426,12 @@ document.getElementById('clearBtn').onclick = () => {
 			if (!line || line[0] === '#') continue;
 			const sp = line.split(/\s+/);
 			const k = sp[0], toks = sp.slice(1);
-			if (k === 'size') { meta.w = +toks[0]; meta.h = +toks[1]; continue; }
-			if (k === 'fill') { meta.fill = toks[0]; continue; }
-			(buckets[k] = buckets[k] || []).push(toks);
+		if (k === 'size') { meta.w = +toks[0]; meta.h = +toks[1]; continue; }
+		if (k === 'fill') { meta.fill = toks[0]; continue; }
+		// View mode: accept both `view voltage` (matches size/fill style) and
+		// the `view:voltage` shorthand suggested by the user.
+		if (k === 'view' || k.startsWith('view:')) { meta.view = k.startsWith('view:') ? k.slice(5) : toks[0]; continue; }
+		(buckets[k] = buckets[k] || []).push(toks);
 		}
 		return { meta, buckets };
 	}
@@ -526,7 +532,7 @@ document.getElementById('clearBtn').onclick = () => {
 		});
 	}
 
-	function finalizeSceneLoad() {
+	function finalizeSceneLoad(meta) {
 		lamps.forEach(l => { if (circles.has(l.idx)) circles.delete(l.idx); });
 		switches.forEach(s => { if (circles.has(s.idx)) circles.delete(s.idx); });
 		manualBatteries.forEach(b => b.poles.forEach(p => { if (circles.has(p)) circles.delete(p); }));
@@ -534,7 +540,9 @@ document.getElementById('clearBtn').onclick = () => {
 		setActiveTool('select', { unlimited: false });
 		const hasElectric = lamps.length || switches.length || manualBatteries.length;
 		const hasAir = airSources.length || airSinks.length || pumps.length;
-		if (hasElectric) setColorView('voltage');
+		// An explicit `view:` in the scene overrides the auto selection.
+		if (meta && meta.view) setColorView(meta.view);
+		else if (hasElectric) setColorView('voltage');
 		else if (hasAir) setColorView('pressure');
 		else setColorView('net');
 		if (switches.length) bus.emit('switch:placed');
@@ -547,7 +555,7 @@ document.getElementById('clearBtn').onclick = () => {
 		let walls = 0, air = 0;
 		for (let i = 0; i < N; i++) (grid[i] ? walls++ : air++);
 		const fillWall = walls >= air;
-		const L = ['# Maze-Push scene v1', `size ${W} ${H}`, `fill ${fillWall ? 'wall' : 'air'}`];
+		const L = ['# Maze-Push scene v1', `size ${W} ${H}`, `fill ${fillWall ? 'wall' : 'air'}`, `view ${colorView}`];
 		const exc = [];
 		for (let i = 0; i < N; i++) if (!!grid[i] !== fillWall) exc.push((i % W) + ',' + ((i / W) | 0));
 		L.push('grid ' + exc.join(' '));
@@ -630,7 +638,7 @@ document.getElementById('clearBtn').onclick = () => {
 		resetBoardForLoad();
 		const parsed = parseSceneText(text);
 		applyMap(parsed);
-		finalizeSceneLoad();
+		finalizeSceneLoad(parsed.meta);
 		logger('Loaded scene from clipboard', 'sys');
 	}
 
@@ -645,6 +653,7 @@ document.getElementById('clearBtn').onclick = () => {
 		pumps.forEach(p => { if (circles.has(p.idx)) circles.delete(p.idx); });
 		setActiveTool('select', { unlimited: false });
 		applyStateFields(parsed);
+		if (parsed.meta && parsed.meta.view) setColorView(parsed.meta.view);
 		simRunning = false;
 		refreshPauseBtn();
 		renderInventory(); render();

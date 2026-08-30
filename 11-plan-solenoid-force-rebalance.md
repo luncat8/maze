@@ -1,12 +1,11 @@
 # Plan: rebalance magnetic vs pressure forces so the solenoid visibly moves
 
-Status: PORTED from `solenoid-v2` commit `de67e9de` (the `09-plan-solenoid-force-rebalance.md`
-there), adapted to **arena-v2** (the active dev branch). The `bat-to-solenoid` scene and its
-coupling test are already in arena-v2 — see `js/ui.js:321` (scene) / `js/ui.js:339` (magnet
+Status: The `bat-to-solenoid` scene and its
+coupling test are already  `js/ui.js:321` (scene) / `js/ui.js:339` (magnet
 tuning) and `js/test_solenoid.js:682` (Test 23, "force coupling only"). This plan covers the
 *missing* piece: making the magnet actually **translate** under the rail field.
 
-## Context (arena-v2 specifics)
+## Context
 
 - Magnetic coupling constant is `K_B` at `js/state.js:149` (`= 40` today; solenoid-v2 used `0.5`,
   so arena is already 80× stronger — but still pressure-dominated, see below).
@@ -25,7 +24,7 @@ tuning) and `js/test_solenoid.js:682` (Test 23, "force coupling only"). This pla
 ## Goal (acceptance)
 
 - With the 10 V battery driving the `bat-to-solenoid` rails, the magnet piston translates
-  **≥ 1 cell** down the channel from rest (within ~600–1500 frames).
+  **≥ 1 cell** down the channel from rest (within ~200–1000 frames).
 - The magnetic force on the solenoid becomes **comparable to** the air-pressure force in the same
   geometry (within ~1 order of magnitude), so the field — not just pressure — decides motion.
 - Regression guardrails: `|vel| < 6` and `lastFcoil` finite for the full scene run (no 1/r²
@@ -34,7 +33,7 @@ tuning) and `js/test_solenoid.js:682` (Test 23, "force coupling only"). This pla
   `test_air.js`, `test_heat.js`. The energy-identity test (`test_solenoid.js` Test 21) must still
   close to ~1e-15.
 
-## Why it fails today (measured in arena-v2)
+## Why it fails today (measured)
 
 Harness probe of `bat-to-solenoid` (magnet held fixed, `vel=0`, `friction=damping=1e9`):
 
@@ -137,4 +136,4 @@ Two independent blockers remain even after scaling `K_B` up:
 5. Tune scene magnet params (`js/ui.js:339`); verify ≥1-cell motion from 10 V.
 6. Update Test 23; run `test_solenoid`, `test_piston_pump`, `test_electric_demo`, `test_air`,
    `test_heat`.
-7. Commit on `arena-v2` (local only — do not push).
+
