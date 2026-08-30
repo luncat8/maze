@@ -508,6 +508,17 @@ function drawCellParticles(i) {
 	ctx.restore();
 }
 
+// Diverging pressure colormap: RED = above ambient, BLUE = below ambient,
+// DARK = ambient. The range (pMinP/pMaxP) is auto-tracked in the air step
+// (air.js), so no O(N) scan is needed. Used by both the cell fill and the
+// legend so they can never drift apart.
+function pressureColor(P) {
+	const d = P - P_AMB;
+	const span = Math.max(pMaxP - P_AMB, P_AMB - pMinP, 1e-6);
+	if (d >= 0) { const f = Math.min(1, d / span); return 'rgb(' + Math.round(30 + 225 * f) + ',' + Math.round(34 + 26 * f) + ',40)'; }
+	const f = Math.min(1, -d / span); return 'rgb(' + Math.round(30 + 10 * f) + ',' + Math.round(34 + 76 * f) + ',' + Math.round(40 + 215 * f) + ')';
+}
+
 function render() {
 	ctx.setTransform(1, 0, 0, 1, 0, 0);
 	ctx.fillStyle = colorView === 'light' ? '#fff' : '#ddd';
@@ -565,20 +576,18 @@ function render() {
 	}
 
 	// ---- Pressure view: pressure fill + advected particles + flow arrows ----
-	// Pressure P = n·T_abs·P_SCALE (PV=nRT). The colormap scales against the
-	// ambient baseline (pAmb), so a uniform room is blue (never all-red).
-	// Particles stream along the velocity field (v = −∇P); short arrows show the
-	// mass-flow direction.
+	// Pressure P = n·T_abs·P_SCALE (PV=nRT). Diverging colormap: RED = above
+	// ambient, BLUE = below ambient, DARK = ambient — so a dam-break's low side
+	// reads blue and its high side red (the old one-sided map clamped both to
+	// blue). The range (pMinP/pMaxP) is auto-tracked in the air step (air.js),
+	// so there is no extra O(N) scan here. Particles stream along v = −∇P.
 	if (colorView === 'pressure') {
 		const N = GRID_W * GRID_H;
-		const pAmb = N0 * R_SPEC * T_AMB * P_SCALE;  // baseline (ambient, Pa)
-		let pMax = pAmb;
-		for (let i = 0; i < N; i++) if (isAir(i) && pressure[i] > pMax) pMax = pressure[i];
-		const span = Math.max(1e-6, pMax - pAmb);
+		// Diverging colormap via pressureColor() (red = above ambient, blue =
+		// below, dark = ambient). Range (pMinP/pMaxP) auto-tracked in air.js.
 		for (let i = 0; i < N; i++) {
 			if (!isAir(i)) continue;
-			const t = Math.max(0, Math.min(1, (pressure[i] - pAmb) / span));
-			ctx.fillStyle = 'rgb(' + Math.round(255 * t) + ',40,' + Math.round(255 * (1 - t)) + ')';
+			ctx.fillStyle = pressureColor(pressure[i]);
 			ctx.fillRect((i % GRID_W) * CELL_SIZE, ((i / GRID_W) | 0) * CELL_SIZE, CELL_SIZE, CELL_SIZE);
 		}
 		// per-cell random particles (count ∝ pressure, speed ∝ |v|)
@@ -1275,28 +1284,28 @@ function render() {
 
 	// ---- Pressure view: pressure legend (bottom-left) ----
 	if (colorView === 'pressure') {
-		const N = GRID_W * GRID_H;
-		const pAmb = N0 * R_SPEC * T_AMB * P_SCALE;  // baseline (ambient, Pa)
-		let pMax = pAmb;
-		for (let i = 0; i < N; i++) if (isAir(i) && pressure[i] > pMax) pMax = pressure[i];
-		const peak = pMax - pAmb;
 		const lx = 6, ly = canvas.height - 52, lw = 132, lh = 46;
 		ctx.fillStyle = 'rgba(17,24,39,0.82)';
 		ctx.fillRect(lx, ly, lw, lh);
 		ctx.strokeStyle = '#374151'; ctx.lineWidth = 1; ctx.strokeRect(lx, ly, lw, lh);
 		const bx = lx + 8, by = ly + 20, bw = lw - 16, bh = 9;
+		// Sample the same pressureColor() the cells use, mapped across the
+		// actual tracked range: low end = blue, ambient = dark, high end = red.
 		for (let g = 0; g < bw; g++) {
 			const t = g / (bw - 1);
-			ctx.fillStyle = 'rgb(' + Math.round(255 * t) + ',40,' + Math.round(255 * (1 - t)) + ')';
+			const P = pMinP + t * (pMaxP - pMinP);
+			ctx.fillStyle = pressureColor(P);
 			ctx.fillRect(bx + g, by, 1, bh);
 		}
 		ctx.textBaseline = 'alphabetic';
 		ctx.fillStyle = '#cbd5e1'; ctx.textAlign = 'left';
 		ctx.fillText('Air pressure (PV=nRT)', lx + 8, ly + 13);
-		ctx.fillStyle = '#9ca3af'; ctx.fillText('ambient', bx, by + bh + 9);
+		const dLo = P_AMB - pMinP, dHi = pMaxP - P_AMB;
+		ctx.fillStyle = '#9ca3af'; ctx.textAlign = 'left'; ctx.fillText('low', bx, by + bh + 9);
+		ctx.textAlign = 'center'; ctx.fillText('ambient', bx + bw / 2, by + bh + 9);
 		ctx.textAlign = 'right'; ctx.fillText('high', bx + bw, by + bh + 9);
 		ctx.textAlign = 'left'; ctx.fillStyle = '#fff';
-		ctx.fillText('peak ΔP ' + (peak >= 10 ? peak.toFixed(0) : peak.toFixed(2)) + ' (Pa)', bx, by + bh + 20);
+		ctx.fillText('ΔP ' + (dLo >= 10 ? dLo.toFixed(0) : dLo.toFixed(1)) + ' / +' + (dHi >= 10 ? dHi.toFixed(0) : dHi.toFixed(1)) + ' Pa', bx, by + bh + 20);
 	}
 }
 

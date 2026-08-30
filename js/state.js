@@ -317,6 +317,8 @@ const PARTICLE_LIFE = 1.4;               // sim-sec before a particle respawns e
 const airN = new Float64Array(HEAT_N);       // air mass (kg)
 const airU = new Float64Array(HEAT_N);       // excess internal energy (J)
 const pressure = new Float64Array(HEAT_N);   // n·R·T_abs (Pa)
+const P_AMB = N0 * R_SPEC * T_AMB * P_SCALE;   // ambient baseline pressure (Pa)
+let pMinP = P_AMB, pMaxP = P_AMB;              // auto-tracked pressure range (air cells only)
 const velX = new Float64Array(HEAT_N), velY = new Float64Array(HEAT_N); // cell velocity (Pressure arrows)
 const cellParticles = [];                // per-cell: array of {x, y, vx, vy, age}
 const cellOpen = new Float32Array(HEAT_N).fill(1); // 0..1 per-cell openness; 1 = open corridor, lower = throttled by valve/portal
@@ -357,6 +359,7 @@ function seedAir() {
 		temp[i] = 0;
 		pressure[i] = (typeof isAir === 'function' ? isAir(i) : (grid[i] === 0 && !blocked[i])) ? pAmb : 0;
 	}
+	pMinP = pAmb; pMaxP = pAmb;   // all air cells are ambient after seeding
 	for (let i = 0; i < cellParticles.length; i++) cellParticles[i].length = 0;
 	for (let i = 0; i < HEAT_N; i++) cellParticles.push([]);
 }

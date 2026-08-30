@@ -377,6 +377,7 @@ function airRelax(sweeps, dt) {
 		syncPistonOccupancy();
 		// (4) derive temp = U / (airN·cv); clamps (safety net only). pressure
 		//     P = n·R·T_abs now depends on mass, temperature, AND cut-cell airVol.
+		pMinP = pAmb; pMaxP = pAmb;   // auto-track range; reset each step (no extra scan)
 		for (let i = 0; i < N; i++) {
 			if (!isAir(i)) { temp[i] = 0; pressure[i] = 0; continue; }
 			const n = airN[i];
@@ -385,6 +386,8 @@ function airRelax(sweeps, dt) {
 			if (t < 0) { t = 0; airU[i] = 0; }
 			temp[i] = t;
 			pressure[i] = (n / Math.max(1e-3, airVol[i])) * R_SPEC * (T_AMB + t) * P_SCALE;
+			if (pressure[i] < pMinP) pMinP = pressure[i];
+			if (pressure[i] > pMaxP) pMaxP = pressure[i];
 		}
 	}
 	// (5) cell velocity for PARTICLES ONLY: v = −∇(P/pAmb) (no-flux at walls).
