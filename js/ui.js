@@ -9,6 +9,8 @@ document.getElementById('btnTypeConnected').onclick = () => { setMazeType('conne
 document.getElementById('btnTypeRandom').onclick = () => { setMazeType('random'); buildMaze(); };
 document.getElementById('btnTypeDivision').onclick = () => { setMazeType('division'); buildMaze(); };
 document.getElementById('btnSelect').onclick = () => setActiveTool('select');
+const moveModeChk = document.getElementById('moveModeChk');
+if (moveModeChk) moveModeChk.onchange = (e) => { moveMode = e.target.checked; updateStatus(); };
 document.querySelectorAll('.strat-btn').forEach(b => {
 	b.onclick = () => setWireStrategy(b.dataset.strat);
 });
@@ -68,6 +70,12 @@ window.addEventListener('keydown', (e) => {
 		if (e.key === 'Enter') { e.preventDefault(); applyPendingPlan(); return; }
 		if (e.key === 'Escape') { e.preventDefault(); cancelPendingPlan(); return; }
 	}
+	if (pendingMove) {
+		const tag = (document.activeElement && document.activeElement.tagName) || '';
+		if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' || tag === 'RANGE') return;
+		if (e.key === 'Enter') { e.preventDefault(); applyItemMovePlan(); return; }
+		if (e.key === 'Escape') { e.preventDefault(); cancelItemMove(); return; }
+	}
 	if (k === 'n') selectGod('node');
 	else if (k === 'e') selectGod('eraser');
 	else if (k === 'w') selectGod('wall');
@@ -104,7 +112,7 @@ document.getElementById('clearBtn').onclick = () => {
 	syncCellOpen();
 	syncPistonOccupancy();
 	seedAir();
-	pendingPlan = null; wireDrag = null; selectedManualWireLen = null; selectedItem = null;
+	pendingPlan = null; wireDrag = null; dragMove = null; pendingMove = null; selectedManualWireLen = null; selectedItem = null;
 	buildNetworks();
 	renderInventory();
 		logger('Cleared all nodes');
@@ -151,7 +159,7 @@ document.getElementById('clearBtn').onclick = () => {
 		INV.airsrc.count = 1; INV.airsink.count = 1;
 		INV.pipevalve.count = 1; INV.pipeportal.count = 1;
 		INV.piston.count = 1; INV.solenoid.count = 1; INV.pump.count = 1;
-		pendingPlan = null; wireDrag = null; selectedManualWireLen = null; selectedItem = null;
+		pendingPlan = null; wireDrag = null; dragMove = null; pendingMove = null; selectedManualWireLen = null; selectedItem = null;
 		unlimited = false;
 		grid.fill(0);
 		buildNetworks();
@@ -403,7 +411,7 @@ document.getElementById('clearBtn').onclick = () => {
 		INV.pipevalve.count = 99; INV.pipeportal.count = 99;
 		INV.piston.count = 99; INV.solenoid.count = 99; INV.pump.count = 99;
 		seedWires();
-		pendingPlan = null; wireDrag = null; selectedManualWireLen = null; selectedItem = null;
+		pendingPlan = null; wireDrag = null; dragMove = null; pendingMove = null; selectedManualWireLen = null; selectedItem = null;
 		unlimited = false;
 	}
 
@@ -1677,6 +1685,7 @@ function placeSolenoid(x, y) {
 // with a GODMODE tool stay silent.
 function handleReturnAt(x, y) {
 	if (pendingPlan) return;
+	if (pendingMove) return;
 	if (x < 0 || x >= GRID_W || y < 0 || y >= GRID_H) return;
 	const idx = y * GRID_W + x;
 	if (blocked[idx]) {
@@ -1741,7 +1750,253 @@ function pickItemAt(x, y) {
 	return null;
 }
 
-canvas.onmousedown = (e) => {
+	// ---- Pointer drag-to-move existing placed items --------------------
+	function itemCells(ref, kind) {
+		if (kind === 'wire') return ref.cells.slice();
+		if (kind === 'battery') return ref.poles.slice();
+		if (kind === 'piston') return bodyCells(ref);
+		if (kind === 'pipeportal') return [ref.a, ref.b];
+		if (kind === 'node') return [ref];
+		return [ref.idx];
+	}
+
+	// Cells a body would occupy if its top-left anchor were `anchor`, keeping
+	// the moving axis (bodyMoveAxis) and span (bodySpan) of the original body.
+	function bodyCellsAt(b, anchor) {
+		const clone = Object.assign({}, b);
+		clone.x = anchor % GRID_W;
+		clone.y = (anchor / GRID_W) | 0;
+		clone.pos = (bodyMoveAxis(b) === 'h') ? clone.x : clone.y;
+		return bodyCells(clone);
+	}
+
+	// True if `idx` is occupied by an item other than `ref` (of `kind`).
+	function otherOccupant(idx, ref, kind) {
+		if (blocked[idx]) return true;
+		if (pipeValves.some(v => v.idx === idx)) return true;
+		if (pipePortals.some(p => (p.a === idx || p.b === idx) && p !== ref)) return true;
+		if (circles.has(idx)) {
+			if (kind === 'node' && ref === idx) return false;
+			if (kind === 'wire' && ref.cells.includes(idx)) return false;
+			if (kind === 'battery' && ref.poles.includes(idx)) return false;
+			return true;
+		}
+		if (lamps.some(l => l.idx === idx && l !== ref)) return true;
+		if (switches.some(s => s.idx === idx && s !== ref)) return true;
+		if (heatSinks.some(h => h.idx === idx && h !== ref)) return true;
+		if (airSources.some(s => s.idx === idx && s !== ref)) return true;
+		if (airSinks.some(s => s.idx === idx && s !== ref)) return true;
+		if (pumps.some(p => p.idx === idx && p !== ref)) return true;
+		if (manualBatteries.some(b => b.poles.includes(idx) && b !== ref)) return true;
+		if (manualWires.some(w => w.cells.includes(idx) && w !== ref)) return true;
+		if (pistons.some(p => bodyCells(p).includes(idx) && p !== ref)) return true;
+		return false;
+	}
+
+	// Whether the candidate target cell is a legal drop for `ref`.
+	function itemTargetFree(ref, kind, toCell, opt) {
+		opt = opt || {};
+		if (toCell == null || toCell < 0 || toCell >= GRID_W * GRID_H) return false;
+		let cells;
+		if (kind === 'battery') {
+			const newAnchor = toCell - (opt.grabOffset || 0);
+			if (((newAnchor / GRID_W) | 0) + 1 >= GRID_H) return false;
+			cells = [newAnchor, newAnchor + GRID_W];
+		} else if (kind === 'piston') {
+			const newAnchor = toCell - (opt.grabOffset || 0);
+			cells = bodyCellsAt(ref, newAnchor);
+		} else if (kind === 'pipeportal') {
+			const delta = toCell - opt.grabbedIdx;
+			cells = [ref.a + delta, ref.b + delta];
+		} else {
+			cells = [(kind === 'node') ? ref : ref.idx];
+		}
+		for (const c of cells) {
+			if (c < 0 || c >= GRID_W * GRID_H) return false;
+			if (otherOccupant(c, ref, kind)) return false;
+		}
+		return true;
+	}
+
+	// Cells to highlight in the move preview for a candidate target.
+	function movePreviewCells(ref, kind, toCell, opt) {
+		opt = opt || {};
+		if (toCell == null) return [];
+		if (kind === 'battery') {
+			const newAnchor = toCell - (opt.grabOffset || 0);
+			if (((newAnchor / GRID_W) | 0) + 1 >= GRID_H) return [];
+			return [newAnchor, newAnchor + GRID_W];
+		} else if (kind === 'piston') {
+			const newAnchor = toCell - (opt.grabOffset || 0);
+			return bodyCellsAt(ref, newAnchor);
+		} else if (kind === 'pipeportal') {
+			const delta = toCell - opt.grabbedIdx;
+			return [ref.a + delta, ref.b + delta];
+		} else {
+			return [(kind === 'node') ? ref : ref.idx];
+		}
+	}
+
+	// Plan a BUILD wire relocation: temporarily extend the pool by the wire's
+	// own segments (they'll be returned by returnWire) so the route can be
+	// shorter (cut) or longer (place) than the original.
+	function planRelocation(path) {
+		const orig = dragMove.ref.segs;
+		orig.forEach(l => WIRES.set(l, (WIRES.get(l) || 0) + 1));
+		const plan = planAllocation(path, wireStrategy);
+		orig.forEach(l => { const c = WIRES.get(l) - 1; if (c <= 0) WIRES.delete(l); else WIRES.set(l, c); });
+		return plan;
+	}
+
+	function beginItemDrag(item, x, y) {
+		pendingPlan = null; wireDrag = null; pendingMove = null;
+		const kind = item.kind, ref = item.ref;
+		const originCell = y * GRID_W + x;
+		const dm = {
+			kind, ref, free: unlimited, originCell, moved: false, valid: true,
+			path: null, plan: null, toCell: null,
+			grabEnd: null, fixedEndIdx: null, grabOffset: 0, grabbedIdx: null, color: null
+		};
+		if (kind === 'wire') {
+			const w = ref;
+			dm.color = w.color;
+			const end0 = w.nodes[0], end1 = w.nodes[w.nodes.length - 1];
+			let grabEnd, fixedEnd;
+			if (originCell === end0) { grabEnd = end0; fixedEnd = end1; }
+			else if (originCell === end1) { grabEnd = end1; fixedEnd = end0; }
+			else {
+				const d0 = Math.abs(originCell - end0), d1 = Math.abs(originCell - end1);
+				if (d0 <= d1) { grabEnd = end0; fixedEnd = end1; }
+				else { grabEnd = end1; fixedEnd = end0; }
+			}
+			dm.grabEnd = grabEnd; dm.fixedEndIdx = fixedEnd;
+		} else if (kind === 'battery') {
+			dm.grabOffset = originCell - ref.poles[0];
+		} else if (kind === 'piston') {
+			dm.grabOffset = originCell - (ref.y * GRID_W + ref.x);
+		} else if (kind === 'pipeportal') {
+			dm.grabbedIdx = item.endpoint;
+		}
+		dragMove = dm;
+		updateItemDrag(x, y);
+		render();
+	}
+
+	function updateItemDrag(x, y) {
+		if (!dragMove) return;
+		const dm = dragMove;
+		if (dm.kind === 'wire') {
+			const target = y * GRID_W + x;
+			if (target === dm.originCell) { dm.moved = false; dm.valid = true; dm.path = null; dm.plan = null; return; }
+			dm.moved = true;
+			const maxLen = dm.free ? GRID_W * GRID_H : (poolTotal() + dm.ref.segs.reduce((a, b) => a + b, 0) + 1);
+			const path = findWirePath(dm.fixedEndIdx, target, maxLen);
+			dm.path = path;
+			if (path.length < 2) { dm.valid = false; dm.plan = null; return; }
+			dm.plan = dm.free ? planUnlimited(path) : planRelocation(path);
+			dm.valid = !!(dm.plan && dm.plan.ok);
+		} else {
+			const toCell = y * GRID_W + x;
+			dm.toCell = toCell;
+			dm.moved = (toCell !== dm.originCell);
+			dm.valid = itemTargetFree(dm.ref, dm.kind, toCell, { grabOffset: dm.grabOffset, grabbedIdx: dm.grabbedIdx });
+		}
+	}
+
+	// Relocate `ref` to `toCell` (no inventory change for non-wire kinds).
+	function applyItemMove(ref, kind, toCell, opt) {
+		opt = opt || {};
+		if (kind === 'node') {
+			const old = circles.get(ref);
+			circles.delete(ref);
+			circles.set(toCell, old);
+		} else if (kind === 'pipeportal') {
+			const delta = toCell - opt.grabbedIdx;
+			ref.a += delta; ref.b += delta;
+			syncCellOpen();
+		} else if (kind === 'battery') {
+			const newAnchor = toCell - (opt.grabOffset || 0);
+			ref.poles.forEach(p => { if (!manualWires.some(o => o.cells.includes(p))) circles.delete(p); });
+			ref.y = (newAnchor / GRID_W) | 0;
+			ref.x = newAnchor % GRID_W;
+			ref.poles = [newAnchor, newAnchor + GRID_W];
+			circles.set(ref.poles[0], { color: ref.term[0], small: false, manual: true, battery: true });
+			circles.set(ref.poles[1], { color: ref.term[1], small: false, manual: true, battery: true });
+		} else if (kind === 'piston') {
+			const newAnchor = toCell - (opt.grabOffset || 0);
+			ref.x = newAnchor % GRID_W; ref.y = (newAnchor / GRID_W) | 0;
+			ref.pos = (bodyMoveAxis(ref) === 'h') ? ref.x : ref.y;
+			syncPistonOccupancy();
+		} else {
+			ref.x = toCell % GRID_W; ref.y = (toCell / GRID_W) | 0; ref.idx = toCell;
+		}
+		buildNetworks();
+		syncCellOpen();
+		syncPistonOccupancy();
+		renderProperties();
+	}
+
+	// GODMODE free re-route of a wire end: recompute nodes from the new path.
+	function rerouteWire(wire, path, plan) {
+		wire.nodes.forEach(nidx => {
+			const stillUsed = manualWires.some(o => o !== wire && o.cells.includes(nidx)) ||
+				manualBatteries.some(b => b.poles.includes(nidx));
+			if (!stillUsed) circles.delete(nidx);
+		});
+		let acc = 0;
+		const nodeIdx = [0];
+		for (const s of plan.segs) { acc += s; nodeIdx.push(acc); }
+		const nodes = nodeIdx.map(i => path[i]);
+		wire.cells = path.slice();
+		wire.nodes = nodes;
+		wire.segs = plan.segs.slice();
+		nodes.forEach(nidx => { if (!circles.has(nidx)) circles.set(nidx, { color: wire.color, small: false, manual: true }); });
+		buildNetworks();
+		bus.emit('wire:placed');
+		render();
+	}
+
+	function applyItemMovePlan() {
+		if (!pendingMove) return;
+		if (pendingMove.kind === 'wire') {
+			const w = pendingMove.ref;
+			if (!pendingMove.plan || !pendingMove.plan.ok) { pendingMove = null; render(); updateStatus(); return; }
+			returnWire(w);
+			if (manualWires.includes(w)) {
+				logger('Cannot move — wire blocked', 'err');
+				pendingMove = null; render(); updateStatus();
+				return;
+			}
+			const prevColor = selectedColor;
+			const prevUnlimited = unlimited;
+			selectedColor = w.color;
+			unlimited = false; // BUILD accounting: consume/cut the pool
+			commitWire(Object.assign({}, pendingMove.plan, { path: pendingMove.path }));
+			unlimited = prevUnlimited;
+			selectedColor = prevColor;
+			pendingMove = null;
+			buildNetworks(); render(); renderInventory();
+		} else {
+			const { ref, kind, toCell, grabOffset, grabbedIdx } = pendingMove;
+			if (!itemTargetFree(ref, kind, toCell, { grabOffset, grabbedIdx })) {
+				logger('Move blocked — destination occupied', 'err');
+				pendingMove = null; render(); updateStatus();
+				return;
+			}
+			applyItemMove(ref, kind, toCell, { grabOffset, grabbedIdx });
+			selectedItem = { kind, ref: kind === 'node' ? toCell : ref };
+			pendingMove = null;
+			buildNetworks(); render(); renderInventory();
+		}
+		updateStatus();
+	}
+
+	function cancelItemMove() {
+		pendingMove = null;
+		render(); updateStatus();
+	}
+
+	canvas.onmousedown = (e) => {
 	if (performance.now() - lastTouch < 500) return; // suppress emulated touch events
 	if (e.button === 1) {                       // middle = pan
 		e.preventDefault();
@@ -1757,6 +2012,10 @@ canvas.onmousedown = (e) => {
 // Pointer press on a cell: the shared editing entry point reused by both
 // mouse (left button) and touch (1-finger tap).
 function pointerDown(x, y) {
+	if (moveMode) {
+		const item = pickItemAt(x, y);
+		if (item && isMovableKind(item.kind)) { beginItemDrag(item, x, y); return; }
+	}
 	if (activeTool === 'wall') {
 		dragging = true; dirty = true; lastCell = x + ',' + y; applyWall(x, y);
 	} else if (activeTool === 'eraser') {
@@ -1798,6 +2057,28 @@ function pointerDown(x, y) {
 
 // Pointer release: ends a drag or commits a wire; shared by mouse + touch.
 function pointerUp() {
+	if (dragMove) {
+		const dm = dragMove;
+		dragMove = null;
+		if (!dm.moved) {
+			selectedItem = pickItemAt(dm.originCell % GRID_W, (dm.originCell / GRID_W) | 0);
+			renderProperties();
+			render();
+			return;
+		}
+		if (!dm.valid) { render(); return; }
+		if (dm.kind === 'wire') {
+			selectedItem = { kind: 'wire', ref: dm.ref };
+			if (dm.free) rerouteWire(dm.ref, dm.path, dm.plan);
+			else pendingMove = { kind: 'wire', ref: dm.ref, path: dm.path, plan: dm.plan };
+		} else {
+			selectedItem = { kind: dm.kind, ref: dm.kind === 'node' ? dm.toCell : dm.ref };
+			if (dm.free) applyItemMove(dm.ref, dm.kind, dm.toCell, { grabOffset: dm.grabOffset, grabbedIdx: dm.grabbedIdx });
+			else pendingMove = { kind: dm.kind, ref: dm.ref, toCell: dm.toCell, grabOffset: dm.grabOffset, grabbedIdx: dm.grabbedIdx, valid: dm.valid };
+		}
+		render(); updateStatus();
+		return;
+	}
 	if (dragging) {
 		dragging = false;
 		if (activeTool === 'wire') releaseWire();
@@ -1808,12 +2089,13 @@ function pointerUp() {
 canvas.onmousemove = (e) => {
 	if (mousePanning) return;
 	const [x, y] = cellFromEvent(e);
-	if (!hoverCell || hoverCell[0] !== x || hoverCell[1] !== y) {
-		hoverCell = [x, y];
-		render();
-		updateStatus(x, y);
-	}
-	if (dragging) {
+		if (!hoverCell || hoverCell[0] !== x || hoverCell[1] !== y) {
+			hoverCell = [x, y];
+			render();
+			updateStatus(x, y);
+		}
+		if (dragMove) { updateItemDrag(x, y); render(); return; }
+		if (dragging) {
 		const key = x + ',' + y;
 		if (key !== lastCell) {
 			lastCell = key;
@@ -1936,10 +2218,11 @@ document.getElementById('btnResetView').onclick = () => {
 };
 canvas.ondblclick = (e) => {
 	if (performance.now() - lastTouch < 500) return; // suppress emulated touch events
-	const [x, y] = cellFromEvent(e);
-	if (pendingPlan) return;
-	handleReturnAt(x, y);
-};
+		const [x, y] = cellFromEvent(e);
+		if (pendingPlan) return;
+		if (pendingMove) return;
+		handleReturnAt(x, y);
+	};
 
 selectGod('node');
 updateStatus();

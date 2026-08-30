@@ -1140,6 +1140,45 @@ function render() {
 		drawPlanJunctions(pendingPlan.path, pendingPlan.segs);
 	}
 
+	// Item move preview (live drag or pending BUILD plan). The original wire
+	// stays drawn underneath (manualWires loop above) for a before/after view.
+	(() => {
+		let mv = null;
+		if (dragMove && dragMove.kind === 'wire' && dragMove.path && dragMove.path.length > 1) {
+			mv = { wire: true, path: dragMove.path, plan: dragMove.plan, color: dragMove.color, valid: dragMove.valid };
+		} else if (pendingMove && pendingMove.kind === 'wire' && pendingMove.path && pendingMove.path.length > 1) {
+			mv = { wire: true, path: pendingMove.path, plan: pendingMove.plan, color: pendingMove.ref.color, valid: true };
+		} else if (dragMove && dragMove.kind !== 'wire' && dragMove.toCell != null) {
+			mv = { wire: false, cells: movePreviewCells(dragMove.ref, dragMove.kind, dragMove.toCell, { grabOffset: dragMove.grabOffset, grabbedIdx: dragMove.grabbedIdx }), valid: dragMove.valid };
+		} else if (pendingMove && pendingMove.kind !== 'wire') {
+			mv = { wire: false, cells: movePreviewCells(pendingMove.ref, pendingMove.kind, pendingMove.toCell, { grabOffset: pendingMove.grabOffset, grabbedIdx: pendingMove.grabbedIdx }), valid: pendingMove.valid };
+		}
+		if (!mv) return;
+		if (mv.wire) {
+			ctx.save();
+			ctx.globalAlpha = 0.55;
+			drawWireCells(mv.path, mv.color);
+			ctx.restore();
+			if (mv.plan && mv.plan.ok) drawPlanJunctions(mv.path, mv.plan.segs);
+			else {
+				const e = mv.path[mv.path.length - 1];
+				const ex = (e % GRID_W) * CELL_SIZE + CELL_SIZE / 2, ey = ((e / GRID_W) | 0) * CELL_SIZE + CELL_SIZE / 2;
+				ctx.strokeStyle = '#ff4444'; ctx.lineWidth = 2; ctx.setLineDash([4, 3]);
+				ctx.beginPath(); ctx.arc(ex, ey, CELL_SIZE * 0.4, 0, Math.PI * 2); ctx.stroke(); ctx.setLineDash([]);
+			}
+		} else {
+			mv.cells.forEach(c => {
+				if (c < 0 || c >= GRID_W * GRID_H) return;
+				const x = (c % GRID_W) * CELL_SIZE, y = ((c / GRID_W) | 0) * CELL_SIZE;
+				ctx.strokeStyle = mv.valid ? '#ffffff' : '#ff4444';
+				ctx.lineWidth = 2;
+				if (!mv.valid) ctx.setLineDash([4, 3]);
+				ctx.strokeRect(x + 1, y + 1, CELL_SIZE - 2, CELL_SIZE - 2);
+				ctx.setLineDash([]);
+			});
+		}
+	})();
+
 	// Draw every node once, on top, positioned on its own lane so it sits on
 	// its wire.
 	circles.forEach((n, idx) => {

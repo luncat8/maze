@@ -134,6 +134,17 @@ let selectedManualWireLen = null;   // explicit length chosen in manual (c) mode
 const manualWires = [];             // placed wires: { color:null, cells:[idx...], nodes:[idx...], segs:[len...] }
 const manualBatteries = [];         // placed batteries: { x, y, term:[c0,c1], poles:[idx0,idx1], energy, maxEnergy }
 let wireDrag = null;                // active placement: { start, target, path, plan }
+
+// ---- Item drag / move (pointer) state ----
+let moveMode = false;               // master "Move items" checkbox (godmove on/off)
+let dragMove = null;                // active drag: { kind, ref, free, originCell, moved, valid, path, plan, toCell, grabEnd, fixedEndIdx, grabOffset, grabbedIdx, color }
+let pendingMove = null;             // awaiting Enter/Esc (BUILD plan move): { kind, ref, path?, plan?, toCell?, grabOffset?, grabbedIdx?, valid? }
+function isMovableKind(kind) {
+	return kind === 'lamp' || kind === 'switch' || kind === 'battery' ||
+		kind === 'heatsink' || kind === 'airsrc' || kind === 'airsink' ||
+		kind === 'pipevalve' || kind === 'pump' || kind === 'piston' ||
+		kind === 'solenoid' || kind === 'wire' || kind === 'node' || kind === 'pipeportal';
+}
 const lamps = [];                   // placed lamps: { x, y, idx, limited, energy, maxEnergy, lumen, wired }
 const switches = [];                // placed switches: { x, y, idx, limited, value, wired }
 const heatSinks = [];               // placed heat sinks: { x, y, idx, limited } (local thermal radiator)
@@ -385,6 +396,7 @@ function setActiveTool(t, opts = {}) {
 	activeGodId = null;
 	unlimited = false;
 	selectedInv = null;
+	pendingMove = null;
 	if (document.getElementById('btnSelect')) document.getElementById('btnSelect').classList.remove('active');
 	document.querySelectorAll('.otype-btn').forEach(b => b.classList.remove('active'));
 
@@ -415,6 +427,10 @@ const OBSTACLE_LABEL = { A: 'Cut + ends', B: 'Cut + rebuild', C: 'Keep wire' };
 function updateStatus(x, y) {
 	if (pendingPlan) {
 		statusBar.textContent = 'Plan ready — Apply (Enter) · Cancel (Esc)';
+		return;
+	}
+	if (pendingMove) {
+		statusBar.textContent = 'Move plan ready — Apply (Enter) · Cancel (Esc)';
 		return;
 	}
 	const tn = activeTool === 'lamp' ? 'Place Lamp' + (unlimited ? ' (∞)' : ' ×' + INV.lamp.count)
