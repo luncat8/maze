@@ -483,6 +483,14 @@ function updateFlow(dt) {
 function heatAirActive() {
 	// Any driver that keeps the air field evolving: lamps (Joule heat), placed
 	// Heat Sinks, global cooling, or any Air Source/Sink.
-	return lamps.length > 0 || heatSinks.length > 0 || coolingEnabled ||
-		airSources.length > 0 || airSinks.length > 0 || pumps.length > 0 || pistons.length > 0;
+	if (lamps.length > 0 || heatSinks.length > 0 || coolingEnabled ||
+		airSources.length > 0 || airSinks.length > 0 || pumps.length > 0 || pistons.length > 0)
+		return true;
+	// Also keep the air sim alive while a pressure gradient exists, so a seeded
+	// gradient (e.g. the "empty" dam-break scene) actually advects and then
+	// auto-idles once it has equalized.
+	const pAmb = N0 * R_SPEC * T_AMB * P_SCALE;
+	for (let i = 0; i < pressure.length; i++)
+		if (isAir(i) && Math.abs(pressure[i] - pAmb) > 1e-3) return true;
+	return false;
 }

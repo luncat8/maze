@@ -1,4 +1,9 @@
-# Plan: Copy Scene (Map) + Copy/Restore Full State
+# Copy Scene (Map) + Copy/Restore Full State
+
+## draft
+
+add button above scenes to copy scene to clipboard. think good format. i think it should calculate number of walls and air and set fill all walls or air to skip same cells. i.e. all walls with 2 air cell - we dont need whole array of walls but just set fill walls and describe only 2 air cells (and possible other items)
+ 2 copy buttons. copy scene map only (objects, items) and copy whole state including temperature, fields, etc.
 
 ## Context
 Repo: `/media/sf_1/mfix/maze-push`, branch `arena-v2` (last commit `fc0125c`). Two new clipboard buttons are needed:

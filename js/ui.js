@@ -338,6 +338,27 @@ document.getElementById('clearBtn').onclick = () => {
 			const ms = bodies[bodies.length - 1];
 			ms.friction = 0; ms.damping = 2; ms.mass = 2; ms.magStrength = 5; // free, lightly-damped magnet so the wire field drives it
 			logger('Scene: Battery → Solenoid — the battery feeds the rails, whose field acts on the magnet. Watch the solenoid respond to the coil field.', 'sys');
+		} else if (name === 'empty') {
+			// Two bare 1-wide air chambers (rows 15 and 21). The 2nd chamber
+			// carries a pressure gradient — 100 kPa on the left half, 1 kPa on
+			// the right half — so air flows left→right once the sim runs.
+			// Pressure is derived from mass each step (P = n·R·T/V), so we seed
+			// airN proportionally to pAmb at ambient T to realize the target P.
+			grid.fill(1);
+			const rc = (x, y) => y * GRID_W + x;
+			for (let x = 2; x <= 28; x++) { grid[rc(x, 15)] = 0; grid[rc(x, 21)] = 0; }
+			buildNetworks();
+			seedAir();
+			const pAmb = N0 * R_SPEC * T_AMB * P_SCALE;
+			for (let x = 2; x <= 28; x++) {
+				const i = rc(x, 21);
+				const targetP = (x <= 15) ? 100000 : 1000;   // 100 kPa left, 1 kPa right
+				airN[i] = N0 * (targetP / pAmb);
+				pressure[i] = targetP;                       // seed pressure directly too (air loop won't run until a gradient exists)
+			}
+			userPaused = false;
+			startSimLoop();                                  // the seeded gradient makes heatAirActive() true, so it dam-breaks then auto-idles
+			logger('Scene: Empty — two air chambers; the lower one is seeded 100 kPa → 1 kPa and flows left→right.', 'sys');
 		}
 		// Stray junction nodes left on lamp/switch/battery-pole cells would
 		// overlap their own glyphs; drop them so they draw cleanly.
@@ -351,6 +372,8 @@ document.getElementById('clearBtn').onclick = () => {
 			setColorView('pressure');
 		} else if (name === 'tunnel-air') {
 			if (airSources.length > 0) selectedItem = { kind: 'airsrc', ref: airSources[0] };
+			setColorView('pressure');
+		} else if (name === 'empty') {
 			setColorView('pressure');
 		} else {
 			const demoLamp = lamps[lamps.length - 1];
