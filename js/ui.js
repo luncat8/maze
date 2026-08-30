@@ -362,6 +362,264 @@ document.getElementById('clearBtn').onclick = () => {
 		renderInventory();
 	}
 
+	// ---- Scene copy / paste (compact, fill + exceptions) ----------------
+	function parseXY(tok) { const a = tok.split(','); return { x: +a[0], y: +a[1] }; }
+
+	function resetBoardForLoad() {
+		circles.clear();
+		pathCells.clear(); pathEdges.clear(); connectedSets.clear();
+		blocked.fill(0); obstacleKind.fill(0); metalCells.fill(0);
+		manualWires.length = 0; manualBatteries.length = 0;
+		lamps.length = 0; switches.length = 0; heatSinks.length = 0;
+		airSources.length = 0; airSinks.length = 0;
+		pipeValves.length = 0; pipePortals.length = 0;
+		pistons.length = 0; pumps.length = 0;
+		pendingPortal = null;
+		INV.battery.count = 99; INV.lamp.count = 99; INV.switch.count = 99;
+		INV.heatsink.count = 99; INV.airsrc.count = 99; INV.airsink.count = 99;
+		INV.pipevalve.count = 99; INV.pipeportal.count = 99;
+		INV.piston.count = 99; INV.solenoid.count = 99; INV.pump.count = 99;
+		seedWires();
+		pendingPlan = null; wireDrag = null; selectedManualWireLen = null; selectedItem = null;
+		unlimited = false;
+	}
+
+	function parseSceneText(text) {
+		const meta = { fill: 'wall' };
+		const buckets = {};
+		for (const raw of text.split('\n')) {
+			const line = raw.trim();
+			if (!line || line[0] === '#') continue;
+			const sp = line.split(/\s+/);
+			const k = sp[0], toks = sp.slice(1);
+			if (k === 'size') { meta.w = +toks[0]; meta.h = +toks[1]; continue; }
+			if (k === 'fill') { meta.fill = toks[0]; continue; }
+			(buckets[k] = buckets[k] || []).push(toks);
+		}
+		return { meta, buckets };
+	}
+
+	function applyMap(parsed) {
+		const { meta, buckets } = parsed;
+		const fillWall = meta.fill !== 'air';
+		grid.fill(fillWall ? 1 : 0);
+		(buckets.grid || []).forEach(toks => toks.forEach(t => {
+			const { x, y } = parseXY(t); grid[y * GRID_W + x] = fillWall ? 0 : 1;
+		}));
+		(buckets.metal || []).forEach(toks => toks.forEach(t => {
+			const { x, y } = parseXY(t); metalCells[y * GRID_W + x] = 1;
+		}));
+		(buckets.obstacle || []).forEach(toks => toks.forEach(t => {
+			const [xy, kind] = t.split(':'); const { x, y } = parseXY(xy);
+			blocked[y * GRID_W + x] = 1;
+			obstacleKind[y * GRID_W + x] = kind === 'A' ? 1 : kind === 'B' ? 2 : 3;
+		}));
+		buildNetworks(); seedAir(); syncCellOpen(); syncPistonOccupancy();
+		const withUnl = (fn) => { const prev = unlimited; unlimited = false; fn(); unlimited = prev; };
+		// Place items that can cut wires (lamp/switch/pump) BEFORE wires so the
+		// captured wire cut-state is reproduced exactly and connectivity is
+		// preserved by overlap/bridging (built-in scenes place switches first).
+		(buckets.node || []).forEach(toks => {
+			const { x, y } = parseXY(toks[0]); const color = toks[1] || '#ffffff';
+			circles.set(y * GRID_W + x, { color, small: false });
+		});
+		(buckets.battery || []).forEach(toks => {
+			const { x, y } = parseXY(toks[0]);
+			const term = toks[1] ? toks[1].split('|') : null;
+			const E = toks.find(t => t.startsWith('E:'));
+			if (term) INV.battery.term = term;
+			withUnl(() => placeBattery(x, y));
+			if (E) { const b = manualBatteries[manualBatteries.length - 1]; if (b) b.energy = +E.slice(2); }
+		});
+		(buckets.lamp || []).forEach(toks => {
+			const { x, y } = parseXY(toks[0]); const u = toks.includes('U');
+			const E = toks.find(t => t.startsWith('E:'));
+			const prev = unlimited; unlimited = u; placeLamp(x, y); unlimited = prev;
+			if (E) { const l = lamps[lamps.length - 1]; if (l) l.energy = +E.slice(2); }
+		});
+		(buckets.switch || []).forEach(toks => {
+			const { x, y } = parseXY(toks[0]); const open = toks[1] === 'open'; const u = toks.includes('U');
+			const prev = unlimited; unlimited = u; placeSwitch(x, y); unlimited = prev;
+			const sw = switches[switches.length - 1]; if (sw) sw.value = !open;
+		});
+		(buckets.pump || []).forEach(toks => {
+			const { x, y } = parseXY(toks[0]);
+			const dir = (toks.find(t => t.startsWith('dir:')) || '').slice(4);
+			withUnl(() => placePump(x, y));
+			const p = pumps[pumps.length - 1]; if (p && dir) p.dir = +dir;
+		});
+		(buckets.wire || []).forEach(toks => {
+			const color = toks[0];
+			const cells = toks.slice(1).map(parseXY).map(c => c.y * GRID_W + c.x);
+			sceneAddWire(cells, color);
+		});
+		const placeBody = (toks, magnet) => {
+			const { x, y } = parseXY(toks[0]); const u = toks.includes('U');
+			const prev = unlimited; unlimited = u;
+			if (magnet) placeSolenoid(x, y); else placePiston(x, y);
+			unlimited = prev;
+			const b = pistons[pistons.length - 1]; if (!b) return;
+			for (const t of toks.slice(1)) {
+				if (t.startsWith('axis:')) b.axis = t.slice(5);
+				else if (t.startsWith('move:')) b.moveAxis = t.slice(5);
+				else if (t.startsWith('pos:')) b.pos = +t.slice(4);
+				else if (t.startsWith('friction:')) b.friction = +t.slice(9);
+				else if (t.startsWith('mag:')) b.magStrength = +t.slice(4);
+				else if (t.startsWith('vel:')) b.vel = +t.slice(4);
+			}
+		};
+		(buckets.piston || []).forEach(t => placeBody(t, false));
+		(buckets.solenoid || []).forEach(t => placeBody(t, true));
+		(buckets.heatsink || []).forEach(t => { const { x, y } = parseXY(t[0]); withUnl(() => placeHeatSink(x, y)); });
+		(buckets.airsrc || []).forEach(t => {
+			const { x, y } = parseXY(t[0]); withUnl(() => placeAirSource(x, y));
+			const s = airSources[airSources.length - 1];
+			if (s) t.forEach(p => { if (p.startsWith('rate:')) s.rate = +p.slice(5); else if (p.startsWith('temp:')) s.temp = +p.slice(5); });
+		});
+		(buckets.airsink || []).forEach(t => {
+			const { x, y } = parseXY(t[0]); withUnl(() => placeAirSink(x, y));
+			const s = airSinks[airSinks.length - 1];
+			if (s) t.forEach(p => { if (p.startsWith('rate:')) s.rate = +p.slice(5); });
+		});
+		(buckets.valve || []).forEach(t => {
+			const { x, y } = parseXY(t[0]); withUnl(() => placePipeValve(x, y));
+			const v = pipeValves[pipeValves.length - 1];
+			if (v) { const o = t.find(p => p.startsWith('open:')); if (o) v.open = +o.slice(5); }
+			syncCellOpen();
+		});
+		(buckets.portal || []).forEach(t => {
+			const a = parseXY(t[0]), b = parseXY(t[1]);
+			const open = t.find(p => p.startsWith('open:'));
+			pipePortals.push({ a: a.y * GRID_W + a.x, b: b.y * GRID_W + b.x, limited: !unlimited, open: open ? +open.slice(5) : 1 });
+			syncCellOpen();
+		});
+	}
+
+	function finalizeSceneLoad() {
+		lamps.forEach(l => { if (circles.has(l.idx)) circles.delete(l.idx); });
+		switches.forEach(s => { if (circles.has(s.idx)) circles.delete(s.idx); });
+		manualBatteries.forEach(b => b.poles.forEach(p => { if (circles.has(p)) circles.delete(p); }));
+		pumps.forEach(p => { if (circles.has(p.idx)) circles.delete(p.idx); });
+		setActiveTool('select', { unlimited: false });
+		const hasElectric = lamps.length || switches.length || manualBatteries.length;
+		const hasAir = airSources.length || airSinks.length || pumps.length;
+		if (hasElectric) setColorView('voltage');
+		else if (hasAir) setColorView('pressure');
+		else setColorView('net');
+		if (switches.length) bus.emit('switch:placed');
+		if (selectedItem) renderProperties();
+		renderInventory(); render();
+	}
+
+	function serializeSceneMap() {
+		const W = GRID_W, H = GRID_H, N = W * H;
+		let walls = 0, air = 0;
+		for (let i = 0; i < N; i++) (grid[i] ? walls++ : air++);
+		const fillWall = walls >= air;
+		const L = ['# Maze-Push scene v1', `size ${W} ${H}`, `fill ${fillWall ? 'wall' : 'air'}`];
+		const exc = [];
+		for (let i = 0; i < N; i++) if (!!grid[i] !== fillWall) exc.push((i % W) + ',' + ((i / W) | 0));
+		L.push('grid ' + exc.join(' '));
+		const metal = [];
+		for (let i = 0; i < N; i++) if (metalCells[i]) metal.push((i % W) + ',' + ((i / W) | 0));
+		if (metal.length) L.push('metal ' + metal.join(' '));
+		const obs = [];
+		for (let i = 0; i < N; i++) if (blocked[i]) { const k = obstacleKind[i] === 1 ? 'A' : obstacleKind[i] === 2 ? 'B' : 'C'; obs.push((i % W) + ',' + ((i / W) | 0) + ':' + k); }
+		if (obs.length) L.push('obstacle ' + obs.join(' '));
+		manualWires.forEach(w => { const seg = w.cells.map(i => (i % W) + ',' + ((i / W) | 0)).join(' '); L.push('wire ' + w.color + ' ' + seg); });
+		manualBatteries.forEach(b => L.push('battery ' + b.x + ',' + b.y + ' ' + b.term[0] + '|' + b.term[1] + ' E:' + Math.round(b.energy)));
+		circles.forEach((n, idx) => { if (!n.manual) L.push('node ' + (idx % W) + ',' + ((idx / W) | 0) + ' ' + n.color); });
+		lamps.forEach(l => L.push('lamp ' + l.x + ',' + l.y + (l.limited ? '' : ' U') + ' E:' + Math.round(l.energy)));
+		switches.forEach(s => L.push('switch ' + s.x + ',' + s.y + ' ' + (s.value ? 'closed' : 'open') + (s.limited ? '' : ' U')));
+		pumps.forEach(p => L.push('pump ' + p.x + ',' + p.y + ' dir:' + p.dir));
+		pistons.forEach(p => L.push((p.magnet ? 'solenoid ' : 'piston ') + p.x + ',' + p.y + ' axis:' + p.axis + ' move:' + p.moveAxis + ' pos:' + p.pos + ' friction:' + p.friction + (p.magStrength != null ? ' mag:' + p.magStrength : '') + ' vel:' + p.vel + (p.limited ? '' : ' U')));
+		heatSinks.forEach(h => L.push('heatsink ' + h.x + ',' + h.y));
+		airSources.forEach(s => L.push('airsrc ' + s.x + ',' + s.y + ' rate:' + s.rate + ' temp:' + s.temp));
+		airSinks.forEach(s => L.push('airsink ' + s.x + ',' + s.y + ' rate:' + s.rate));
+		pipeValves.forEach(v => L.push('valve ' + v.x + ',' + v.y + ' open:' + v.open));
+		pipePortals.forEach(p => L.push('portal ' + (p.a % W) + ',' + ((p.a / W) | 0) + ' ' + (p.b % W) + ',' + ((p.b / W) | 0) + ' open:' + p.open));
+		return L.join('\n');
+	}
+
+	function serializeFullState() {
+		const L = [serializeSceneMap()];
+		const W = GRID_W, H = GRID_H, N = W * H;
+		const pAmb = N0 * R_SPEC * T_AMB * P_SCALE;
+		const pushField = (name, baseline, arr, overAirOnly, eps, digits) => {
+			const exc = [];
+			for (let i = 0; i < N; i++) {
+				if (overAirOnly && !isAir(i)) continue;
+				if (Math.abs(arr[i] - baseline) > eps) exc.push((i % W) + ',' + ((i / W) | 0) + ':' + arr[i].toFixed(digits));
+			}
+			if (exc.length) L.push('field ' + name + ' ' + baseline + ' ' + exc.join(' '));
+		};
+		pushField('temp', 0, temp, false, 1e-4, 3);
+		pushField('airU', 0, airU, false, 1e-2, 2);
+		pushField('airN', N0, airN, false, 1e-4, 4);
+		pushField('pressure', pAmb, pressure, true, 1e-1, 1);
+		const vExc = [];
+		voltages.forEach((v, idx) => { if (Math.abs(v) > 1e-3) vExc.push((idx % W) + ',' + ((idx / W) | 0) + ':' + v.toFixed(3)); });
+		if (vExc.length) L.push('field voltage 0 ' + vExc.join(' '));
+		const bExc = [];
+		if (fieldBz) for (let i = 0; i < N; i++) { const v = fieldBz[i]; if (Math.abs(v) > 1e-9) bExc.push((i % W) + ',' + ((i / W) | 0) + ':' + v.toFixed(4)); }
+		if (bExc.length) L.push('field bfield 0 ' + bExc.join(' '));
+		const cExc = [];
+		cellColor.forEach((c, idx) => cExc.push((idx % W) + ',' + ((idx / W) | 0) + ':' + c));
+		if (cExc.length) L.push('color ' + cExc.join(' '));
+		return L.join('\n');
+	}
+
+	function applyStateFields(parsed) {
+		const { buckets } = parsed;
+		const N = GRID_W * GRID_H;
+		// Pressure is intentionally left as set by seedAir() in applyMap, which
+		// runs before pumps/pistons are placed; air cells that later become
+		// pump/piston bodies therefore keep pAmb (matching the original scene's
+		// behavior). Re-deriving pressure from isAir here would zero those cells,
+		// breaking round-trip. Field pressure exceptions below still apply on top.
+		temp.fill(0); airU.fill(0); airN.fill(N0);
+		if (!fieldBz || fieldBz.length !== N) fieldBz = new Float64Array(N);
+		fieldBz.fill(0);
+		const setArr = (arr, t) => { const [xy, v] = t.split(':'); const { x, y } = parseXY(xy); arr[y * GRID_W + x] = +v; };
+		(buckets.field || []).forEach(toks => {
+			const name = toks[0];
+			const rest = toks.slice(2);
+			if (name === 'temp') rest.forEach(t => setArr(temp, t));
+			else if (name === 'airU') rest.forEach(t => setArr(airU, t));
+			else if (name === 'airN') rest.forEach(t => setArr(airN, t));
+			else if (name === 'pressure') rest.forEach(t => setArr(pressure, t));
+			else if (name === 'voltage') rest.forEach(t => { const [xy, v] = t.split(':'); const { x, y } = parseXY(xy); voltages.set(y * GRID_W + x, +v); });
+			else if (name === 'bfield') rest.forEach(t => setArr(fieldBz, t));
+		});
+		cellColor.clear();
+		(buckets.color || []).forEach(toks => toks.forEach(t => { const [xy, c] = t.split(':'); const { x, y } = parseXY(xy); cellColor.set(y * GRID_W + x, c); }));
+	}
+
+	function loadMapFromText(text) {
+		resetBoardForLoad();
+		const parsed = parseSceneText(text);
+		applyMap(parsed);
+		finalizeSceneLoad();
+		logger('Loaded scene from clipboard', 'sys');
+	}
+
+	function loadFullStateFromText(text) {
+		resetBoardForLoad();
+		userPaused = true;
+		const parsed = parseSceneText(text);
+		applyMap(parsed);
+		lamps.forEach(l => { if (circles.has(l.idx)) circles.delete(l.idx); });
+		switches.forEach(s => { if (circles.has(s.idx)) circles.delete(s.idx); });
+		manualBatteries.forEach(b => b.poles.forEach(p => { if (circles.has(p)) circles.delete(p); }));
+		pumps.forEach(p => { if (circles.has(p.idx)) circles.delete(p.idx); });
+		setActiveTool('select', { unlimited: false });
+		applyStateFields(parsed);
+		simRunning = false;
+		refreshPauseBtn();
+		renderInventory(); render();
+		logger('Loaded full state (paused) — resume Play to recompute derived fields', 'sys');
+	}
+
 	document.querySelectorAll('[data-scene]').forEach(b => {
 		b.onclick = () => loadScene(b.dataset.scene);
 	});
@@ -462,6 +720,45 @@ document.getElementById('copyPathsBtn').onclick = () => {
 		logger('Copy failed (clipboard unavailable)', 'err');
 	}
 };
+
+	// ---- Scene copy / paste buttons -------------------------------------
+	function sceneCopyFallback(text) {
+		const ta = document.createElement('textarea');
+		ta.value = text;
+		ta.style.position = 'fixed';
+		ta.style.left = '-9999px';
+		document.body.appendChild(ta);
+		ta.select();
+		let ok = false;
+		try { ok = document.execCommand('copy'); } catch (e) { ok = false; }
+		document.body.removeChild(ta);
+		return ok;
+	}
+	function sceneWrite(text, msg) {
+		if (navigator.clipboard && navigator.clipboard.writeText) {
+			navigator.clipboard.writeText(text)
+				.then(() => logger(msg, 'sys'))
+				.catch(() => { if (sceneCopyFallback(text)) logger(msg, 'sys'); else logger('Copy failed (clipboard blocked)', 'err'); });
+		} else if (sceneCopyFallback(text)) {
+			logger(msg, 'sys');
+		} else {
+			logger('Copy failed (clipboard unavailable)', 'err');
+		}
+	}
+	const pasteSceneText = () => {
+		const apply = (t) => {
+			if (!t || !t.trim()) return;
+			/^(field|color) /m.test(t) ? loadFullStateFromText(t) : loadMapFromText(t);
+		};
+		if (navigator.clipboard && navigator.clipboard.readText) {
+			navigator.clipboard.readText().then(apply).catch(() => { const t = window.prompt('Paste scene/state text:'); if (t) apply(t); });
+		} else {
+			const t = window.prompt('Paste scene/state text:'); if (t) apply(t);
+		}
+	};
+	document.getElementById('copyMapBtn').onclick = () => sceneWrite(serializeSceneMap(), 'Copied scene map to clipboard');
+	document.getElementById('copyStateBtn').onclick = () => sceneWrite(serializeFullState(), 'Copied full state to clipboard');
+	document.getElementById('pasteBtn').onclick = pasteSceneText;
 
 document.querySelectorAll('.card-head').forEach(head => {
 	head.addEventListener('click', (e) => {

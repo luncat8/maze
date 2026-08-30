@@ -165,6 +165,11 @@
 					<button class="tool-btn" id="btnTypeDivision" title="New Recursive Division Maze">
 						<svg viewBox="0 0 24 24"><rect x="3" y="3" width="18" height="18" rx="1"/><path d="M12 3v9M12 12h9M3 15h9M12 15v6"/></svg></button>
 				</div>
+				<div class="tool-row" id="sceneClipRow" style="margin-bottom:6px; flex-wrap:wrap;">
+					<button type="button" id="copyMapBtn" class="tool-btn" title="Copy scene map (geometry + items)">⧉ Copy Map</button>
+					<button type="button" id="copyStateBtn" class="tool-btn" title="Copy full sim state (map + temp/pressure/voltage/Bz)">⧉ Copy State</button>
+					<button type="button" id="pasteBtn" class="tool-btn" title="Paste a copied scene or state">⧉ Paste</button>
+				</div>
 				<div class="label">Scenes</div>
 				<div class="tool-row" id="sceneRow" style="flex-wrap: wrap;">
 				<button type="button" class="otype-btn" data-scene="electric-combo" title="Combined circuit: 2 batteries in series → 2 switches in series → 1 lamp → 2 parallel lamps, each with its own switch. Toggle switches; watch series voltage (~2·Vbat) emerge and parallel branches act independently.">Electricity</button>
