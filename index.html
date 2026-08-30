@@ -171,6 +171,8 @@
 				<button type="button" class="otype-btn" data-scene="tunnel-air" title="20×1 sealed air tunnel: Air Source (3,15) → Air Sink (17,15). Watch the PV=nRT pressure gradient in the Air/Pressure views.">Air Tunnel</button>
 				<button type="button" class="otype-btn" data-scene="piston-pump" title="Sealed chamber with Air Pump and 2×1 Piston: Pump builds pressure that pushes the piston against friction.">Piston &amp; Pump</button>
 				<button type="button" class="otype-btn" data-scene="solenoid-lab" title="Gas moves a magnet piston (generator) whose induced current drives a second magnet (motor).">Solenoid Lab</button>
+				<button type="button" class="otype-btn" data-scene="solenoid-loop" title="Magnet piston inside a battery-fed rectangular wire loop. Push it (Air Source) to generate, or drive the loop (battery) to motor it.">Solenoid Loop</button>
+				<button type="button" class="otype-btn" data-scene="bat-to-solenoid" title="Battery feeds two parallel rails whose field acts on a magnet piston (solenoid) riding the channel between them.">Bat&rarr;Solenoid</button>
 				</div>
 			</div>
 			<div id="advanced">
@@ -369,34 +371,6 @@
 				<div class="card-head" data-target="path-card">
 					<span class="fold">&#x25be;</span><span class="ht">Path List</span>
 					<button id="copyPathsBtn" title="Copy nodes &amp; links" style="cursor: pointer; font-size: 13px; line-height: 1; padding: 2px 6px; background: #333; color: #eee; border: 1px solid #555; border-radius: 4px;">&#x2219;&#x2219;</button>
-				</div>
-				<div id="path-list"></div>
-			</div>
-			<div class="card" id="inv-card">
-				<div class="card-head" data-target="inv-card">
-					<span class="fold">&#x25be;</span><span class="ht">Inventory</span>
-				</div>
-				<div id="inv-list"></div>
-			</div>
-			<div class="card" id="log-card">
-				<div class="card-head" data-target="log-card">
-					<span class="fold">&#x25be;</span><span class="ht">System Log</span>
-				</div>
-				<div id="log"></div>
-			</div>
-		</div>
-	</div>
-
-	<script src="js/state.js"></script>
-	<script src="js/maze.js"></script>
-	<script src="js/network.js"></script>
-	<script src="js/render.js"></script>
-	<script src="js/electric.js"></script>
-	<script src="js/air.js"></script>
-	<script src="js/ui.js"></script>
-</body>
-</html>
-n" title="Copy nodes &amp; links" style="cursor: pointer; font-size: 13px; line-height: 1; padding: 2px 6px; background: #333; color: #eee; border: 1px solid #555; border-radius: 4px;">&#x2219;&#x2219;</button>
 				</div>
 				<div id="path-list"></div>
 			</div>

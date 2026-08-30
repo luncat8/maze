@@ -22,6 +22,16 @@ function setColorView(v) {
 	document.getElementById('btnViewPressure').classList.toggle('active', v === 'pressure');
 	const bf = document.getElementById('btnViewBField');
 	if (bf) bf.classList.toggle('active', v === 'bfield');
+	if (v === 'bfield') {
+		// Populate the Bz overlay immediately, even if the unified sim loop is
+		// idle: rebuild edges/systems, relax the current field, then recompute so
+		// the overlay reflects the live current (wire Bz shows with no magnet).
+		if (magnetList().length || electricActive()) {
+			fieldSimulate();
+			fieldRelax(FIELD_SWEEPS_PER_FRAME);
+			fieldSimulate();
+		}
+	}
 	render();
 	updateStatus();
 }
@@ -37,6 +47,8 @@ document.getElementById('btnViewLight').addEventListener('mouseenter', () => set
 	document.getElementById('btnViewHeat').addEventListener('mouseenter', () => setColorView('heat'));
 	document.getElementById('btnViewPressure').onclick = () => setColorView('pressure');
 	document.getElementById('btnViewPressure').addEventListener('mouseenter', () => setColorView('pressure'));
+	document.getElementById('btnViewBField').onclick = () => setColorView('bfield');
+	document.getElementById('btnViewBField').addEventListener('mouseenter', () => setColorView('bfield'));
 function setWireStrategy(s) {
 	wireStrategy = s;
 	if (s !== 'c') selectedManualWireLen = null;
@@ -282,6 +294,50 @@ document.getElementById('clearBtn').onclick = () => {
 			placeSolenoid(22, 12); // Case A in the motor shaft if conductors on both sides
 			if (pistons[1]) { pistons[1].friction = 20; }
 			logger('Scene: Solenoid Lab — gas drives the left magnet (generator); current in the loop pushes the right magnet (motor).', 'sys');
+		} else if (name === 'solenoid-loop') {
+			// Bidirectional electromechanical demo: a battery-fed rectangular wire
+			// loop (with a lamp load) wraps a 3-row chamber. A magnet piston
+			// (solenoid) sits inside the loop as a moving conductor/dipole:
+			//   - push it from the Air Source and it GENERATES (lamp lights, Lenz drag);
+			//   - drive the loop from the battery and it MOTORS (force on the magnet).
+			// One kernel (Biot–Savart) gives both directions; energy closes by
+			// construction (Σ E·I + F·v = 0).
+			const rc = (x, y) => y * GRID_W + x;
+			grid.fill(1);
+			for (let y = 14; y <= 16; y++)
+				for (let x = 4; x <= 26; x++) grid[y * GRID_W + x] = 0;
+			buildNetworks();
+			seedAir();
+			const sLoop = [];
+			for (let x = 6; x <= 24; x++) sLoop.push(rc(x, 14));        // top rail
+			for (let y = 15; y <= 16; y++) sLoop.push(rc(24, y));      // right rail
+			for (let x = 23; x >= 6; x--) sLoop.push(rc(x, 16));       // bottom rail
+			sLoop.push(rc(6, 15));                                     // left rail back
+			sceneAddWire(sLoop, '#f59e0b');
+			placeBattery(6, 14);
+			placeLamp(15, 14);
+			placeSolenoid(15, 15);
+			logger('Scene: Solenoid Loop — magnet piston in a wire loop. Push it (Air Source) to generate, or drive the loop (battery) to motor it.', 'sys');
+		} else if (name === 'bat-to-solenoid') {
+			// Battery → linear solenoid. A single battery feeds two parallel current
+			// rails that bound a horizontal air channel; the magnet piston (solenoid)
+			// rides the channel between the rails. The rail currents build a field
+			// that acts on the magnet — the wire field drives the solenoid.
+			const rc = (x, y) => y * GRID_W + x;
+			grid.fill(1);
+			for (let y = 2; y <= 4; y++)
+				for (let x = 2; x <= 30; x++) grid[y * GRID_W + x] = 0;
+			buildNetworks();
+			seedAir();
+			const topRail = []; for (let x = 2; x <= 30; x++) topRail.push(rc(x, 2)); sceneAddWire(topRail, '#f59e0b');
+			const botRail = []; for (let x = 2; x <= 30; x++) botRail.push(rc(x, 4)); sceneAddWire(botRail, '#f59e0b');
+			sceneAddWire([rc(30, 2), rc(30, 3), rc(30, 4)], '#f59e0b');   // right return
+			sceneAddWire([rc(2, 3), rc(2, 4)], '#f59e0b');                // battery → bottom rail
+			placeBattery(2, 2);                                          // poles (2,2) top rail, (2,3) link
+			placeSolenoid(5, 3);                                         // magnet at x5..6, y3 (between rails)
+			const ms = bodies[bodies.length - 1];
+			ms.friction = 0; ms.damping = 2; ms.mass = 2; ms.magStrength = 5; // free, lightly-damped magnet so the wire field drives it
+			logger('Scene: Battery → Solenoid — the battery feeds the rails, whose field acts on the magnet. Watch the solenoid respond to the coil field.', 'sys');
 		}
 		// Stray junction nodes left on lamp/switch/battery-pole cells would
 		// overlap their own glyphs; drop them so they draw cleanly.

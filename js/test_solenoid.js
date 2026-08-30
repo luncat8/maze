@@ -117,6 +117,39 @@ function loopWire(x0, y0, x1, y1) {
 	`);
 }
 
+// Build a rectangular wire loop (ring) of given bounds in an open chamber,
+// optionally with a battery + lamp, leaving the interior open for a magnet.
+function buildLoopSetup(opts) {
+	const o = Object.assign({ x0: 6, x1: 24, y0: 14, y1: 16, battery: true, lamp: true }, opts || {});
+	return `
+		INV.battery.count = 10; INV.lamp.count = 10; unlimited = false;
+		grid.fill(1);
+		for (let y = ${o.y0 - 1}; y <= ${o.y1 + 1}; y++)
+			for (let x = ${o.x0 - 2}; x <= ${o.x1 + 2}; x++) grid[y * GRID_W + x] = 0;
+		buildNetworks();
+		seedAir();
+		var rc = (x, y) => y * GRID_W + x;
+		var sLoop = [];
+		for (let x = ${o.x0}; x <= ${o.x1}; x++) sLoop.push(rc(x, ${o.y0}));
+		for (let y = ${o.y0 + 1}; y <= ${o.y1}; y++) sLoop.push(rc(${o.x1}, y));
+		for (let x = ${o.x1 - 1}; x >= ${o.x0}; x--) sLoop.push(rc(x, ${o.y1}));
+		sLoop.push(rc(${o.x0}, ${o.y0 + 1}));
+		sceneAddWire(sLoop, '#f59e0b');
+		${o.battery ? 'placeBattery(' + o.x0 + ', ' + o.y0 + ');' : ''}
+		${o.lamp ? 'placeLamp(' + Math.floor((o.x0 + o.x1) / 2) + ', ' + o.y0 + ');' : ''}
+		manualWires.forEach(w => { w.nodes.forEach(n => { if (!circles.has(n)) circles.set(n, { color: w.color, small: false, manual: true }); }); });
+	`;
+}
+
+// Run fieldSimulate -> relax(steps) -> fieldPublish. Callers read globals afterwards.
+function simulate(steps) {
+	runCode(`
+		fieldSimulate();
+		for (let k = 0; k < ${steps}; k++) fieldRelax(FIELD_SWEEPS_PER_FRAME);
+		fieldPublish();
+	`);
+}
+
 // ---- 1. dirs / kernel orientation ----
 console.log('\n== Test 1: dirs ordering and kernel cross-product ==');
 const dirs = getRef('dirs');
@@ -207,8 +240,8 @@ runCode(`
 const w = sandbox.__w;
 assert(w.nE > 0, `edge registry populated (${w.nE} edges)`);
 assert(Math.abs(w.F1) > 1e-6 || Math.abs(w.B1) > 1e-6, `magnet beside a live loop feels B or F (B=${w.B1}, F=${w.F1})`);
-assert(Math.sign(w.B1) !== Math.sign(w.B2) || Math.sign(w.F1) !== Math.sign(w.F2),
-	'reversing polarity reverses Bz and/or F');
+assert(Math.sign(w.F1) === -Math.sign(w.F2) && Math.abs(w.F1) > 1e-4 && Math.abs(w.F2) > 1e-4,
+	'reversing polarity reverses F_coil with finite magnitude (F1=' + w.F1.toExponential(2) + ', F2=' + w.F2.toExponential(2) + ')');
 
 runCode(`
 	manualBatteries.length = 0;
@@ -248,7 +281,8 @@ runCode(`
 `);
 const rails = sandbox.__rails;
 assert(Number.isFinite(rails.Bmid), `Bz between rails is finite (${rails.Bmid.toFixed(4)})`);
-assert(Math.abs(rails.Fend) >= 0, `force at the rail end is defined (${rails.Fend.toFixed(3)} N)`);
+assert(Number.isFinite(rails.Fend), `force is well-defined (no NaN) for the magnet beside the energized rails (F=${rails.Fend.toFixed(4)} N)`);
+assert(Number.isFinite(rails.Bmid), `Bz is finite between the opposite-current rails (B=${rails.Bmid.toFixed(4)})`);
 
 // ---- 5. arbitrary geometry: L-shaped run matches analytic kernel ----
 console.log('\n== Test 5: arbitrary geometry (no pattern matching) ==');
@@ -497,7 +531,172 @@ runCode(`
 	dt = (1 / 60 * 10) / 24;
 	airRelax(24, dt);
 `);
-assert(true, 'scene simulate/relax/publish/air threw no exception');
+const labMag = getRef('pistons').find(p => p.magnet);
+const labEdges = getRef('fieldEdges');
+assert(Number.isFinite(labMag.lastFcoil) && labEdges.length > 0,
+	'scene magnet reports finite force and the edge registry is populated (no NaN, edges=' + labEdges.length + ')');
+
+// ---- 16. solenoid-loop scene smoke ----
+console.log('\n== Test 16: solenoid-loop scene ==');
+let loopErr = null;
+try { runCode(`loadScene('solenoid-loop');`); } catch (e) { loopErr = e; }
+assert(loopErr === null, 'loadScene("solenoid-loop") runs without exception' + (loopErr ? ' (' + loopErr.message + ')' : ''));
+assert(getRef('pistons').filter(p => p.magnet).length === 1, 'solenoid-loop places exactly one magnet piston');
+assert(getRef('manualWires').length >= 1, 'solenoid-loop lays a wire loop');
+runCode(`for (let s = 0; s < 5; s++) { fieldSimulate(); fieldRelax(FIELD_SWEEPS_PER_FRAME); fieldPublish(); }`);
+assert(Number.isFinite(getRef('pistons')[0].lastFcoil), 'solenoid-loop magnet reports finite force after stepping');
+
+// ---- 17. bat-to-solenoid scene smoke ----
+console.log('\n== Test 17: bat-to-solenoid scene ==');
+let btsErr = null;
+try { runCode(`loadScene('bat-to-solenoid');`); } catch (e) { btsErr = e; }
+assert(btsErr === null, 'loadScene("bat-to-solenoid") runs without exception' + (btsErr ? ' (' + btsErr.message + ')' : ''));
+assert(getRef('pistons').filter(p => p.magnet).length === 1, 'bat-to-solenoid places exactly one magnet piston');
+assert(getRef('manualBatteries').length === 1, 'bat-to-solenoid places one battery');
+assert(getRef('manualWires').length >= 2, 'bat-to-solenoid lays current rails');
+runCode(`bodies[0].vel = 0; for (let s = 0; s < 60; s++) { fieldSimulate(); fieldRelax(FIELD_SWEEPS_PER_FRAME); fieldPublish(); }`);
+assert(Math.abs(getRef('bodies')[0].lastFcoil) > 1e-4, `energized rails act on the solenoid (|F|=${Math.abs(getRef('bodies')[0].lastFcoil).toExponential(3)} N)`);
+
+// ---- 18. force from current: polarity flip + zero current ----
+console.log('\n== Test 18: Force-from-current — polarity flip and zero-current ==');
+runCode(buildLoopSetup({ battery: true, lamp: false }) + `
+	bodies.length = 0;
+	var m = createMechanicalBody({ kind: 'solenoid', x: 12, y: 15, axis: 'h', magnet: true });
+	m.magStrength = 1; m.vel = 0; m.friction = 0; m.damping = 0;
+	bodies.push(m);
+`);
+simulate(20);
+const F_batt = getRef('bodies')[0].lastFcoil;
+assert(Math.abs(F_batt) > 1e-4, `magnet beside an energized loop feels force |F|=${Math.abs(F_batt).toExponential(3)} N`);
+runCode(`bodies[0].magStrength = -1;`);
+simulate(20);
+const F_rev = getRef('bodies')[0].lastFcoil;
+assert(Math.sign(F_rev) === -Math.sign(F_batt) && Math.abs(F_rev) > 1e-4,
+	`reversing polarity reverses F_coil (sign ${Math.sign(F_batt)} -> ${Math.sign(F_rev)})`);
+runCode(`manualBatteries.length = 0; bodies[0].magStrength = 1;`);
+simulate(20);
+const F_zero = getRef('bodies')[0].lastFcoil;
+assert(Math.abs(F_zero) < 1e-6, `no current => F ≈ 0 (got ${F_zero.toExponential(2)})`);
+
+// ---- 19. generator: lamp lights + Lenz drag ----
+console.log('\n== Test 19: Generator — moving magnet induces EMF, lamp lights, Lenz drag ==');
+runCode(buildLoopSetup({ battery: true, lamp: true }) + `
+	bodies.length = 0;
+	var m = createMechanicalBody({ kind: 'solenoid', x: 12, y: 15, axis: 'h', magnet: true });
+	m.magStrength = 2; m.vel = 2; m.friction = 0; m.damping = 0;
+	bodies.push(m);
+`);
+simulate(25);
+const gen = getRef('bodies')[0];
+const lampGen = getRef('lamps')[0];
+assert(gen.lastPower > 0, `generator delivers power to the loop (lastPower=${gen.lastPower.toFixed(3)} W > 0)`);
+assert(gen.lastFcoil * gen.vel < 0, `Lenz drag: F·v < 0 (F=${gen.lastFcoil.toFixed(2)}, v=${gen.vel})`);
+assert(Math.abs(lampGen.dV) > getRef('DV_LIT'), `lamp receives current: |dV|=${Math.abs(lampGen.dV).toFixed(3)} V > DV_LIT (${getRef('DV_LIT')})`);
+runCode(buildLoopSetup({ battery: false, lamp: true }) + `
+	bodies.length = 0;
+	var m = createMechanicalBody({ kind: 'solenoid', x: 12, y: 15, axis: 'h', magnet: true });
+	m.magStrength = 2; m.vel = 2; m.friction = 0; m.damping = 0;
+	bodies.push(m);
+`);
+simulate(25);
+const genB = getRef('bodies')[0];
+assert(Math.abs(genB.lastCurrent) > 1e-4 && genB.lastPower > 0, `battery-less loop still injects EMF (|I|=${Math.abs(genB.lastCurrent).toExponential(2)} A, P=${genB.lastPower.toFixed(3)} W > 0)`);
+runCode(`manualWires.length = 0; lamps.length = 0; bodies[0].vel = 2;`);
+simulate(25);
+const genOpen = getRef('bodies')[0];
+assert(Math.abs(genOpen.lastPower) < 1e-6, `open loop => no generated power (P=${genOpen.lastPower.toExponential(2)})`);
+
+// ---- 20. motor drive + back-EMF identity ----
+console.log('\n== Test 20: Motor — battery drives magnet; motion injects back-EMF ==');
+runCode(buildLoopSetup({ battery: true, lamp: false }) + `
+	bodies.length = 0;
+	var m = createMechanicalBody({ kind: 'solenoid', x: 12, y: 15, axis: 'h', magnet: true });
+	m.magStrength = 1; m.vel = 0; m.friction = 0; m.damping = 0;
+	bodies.push(m);
+`);
+simulate(20);
+const motor0 = getRef('bodies')[0];
+const I0 = Math.abs(motor0.lastCurrent);
+const F0 = motor0.lastFcoil;
+const P0 = motor0.lastPower;
+assert(I0 > 1e-3, `battery drives the magnet at rest (|I|=${I0.toExponential(3)} A)`);
+assert(Math.abs(F0) > 1e-4, `battery current exerts a motor force on the magnet (F=${F0.toFixed(3)} N)`);
+runCode(`bodies[0].vel = 3;`);
+simulate(20);
+const motorV = getRef('bodies')[0];
+const I1 = Math.abs(motorV.lastCurrent);
+const P1 = motorV.lastPower;
+assert(Math.abs(motorV.lastEMF) > 1e-6, `motion injects a back-EMF (E=${motorV.lastEMF.toFixed(3)} V)`);
+assert(Math.abs(P1) > Math.abs(P0) + 1e-9, `conversion power grows with speed (|P|=${Math.abs(P1).toFixed(3)} W > rest ${Math.abs(P0).toFixed(3)})`);
+assert(Math.abs(I1 - I0) > 1e-4, `back-EMF changes the loop current from rest (${I0.toExponential(2)} -> ${I1.toExponential(2)} A)`);
+assert(Math.abs(motorV.lastPower + motorV.lastFcoil * motorV.vel) < 1e-6,
+	`back-EMF identity holds: P = −F·v (P=${motorV.lastPower.toFixed(3)}, −F·v=${(-motorV.lastFcoil * motorV.vel).toFixed(3)})`);
+
+// ---- 21. energy identity Σ E·I + Σ F·v ≈ 0 (arena fieldEdges + bodies) ----
+console.log('\n== Test 21: Energy identity Σ_e E_e·I_e + Σ_b F_b·v_b ≈ 0 ==');
+runCode(buildLoopSetup({ battery: true, lamp: true }) + `
+	bodies.length = 0;
+	var m = createMechanicalBody({ kind: 'solenoid', x: 12, y: 15, axis: 'h', magnet: true });
+	m.magStrength = 2; m.vel = 3; m.friction = 0; m.damping = 0;
+	bodies.push(m);
+`);
+simulate(30);
+runCode(`
+	let EI = 0;
+	for (let ei = 0; ei < fieldEdges.length; ei++) EI += fieldEdges[ei].E * fieldEdges[ei].I;
+	let Fv = 0;
+	for (let bi = 0; bi < bodies.length; bi++) if (bodies[bi].magnet) Fv += bodies[bi].lastFcoil * (bodies[bi].vel || 0);
+	globalThis.__EI = EI; globalThis.__Fv = Fv;
+`);
+const EI = sandbox.__EI, Fv = sandbox.__Fv;
+assert(Math.abs(EI + Fv) < 1e-6,
+	`energy identity closes: ΣE·I=${EI.toExponential(3)}, ΣF·v=${Fv.toExponential(3)}, |sum|=${(EI + Fv).toExponential(2)}`);
+
+// ---- 22. Lenz drag: closed vs open ----
+console.log('\n== Test 22: Lenz drag — closed loop opposes, open does not ==');
+runCode(buildLoopSetup({ battery: false, lamp: true }) + `
+	bodies.length = 0;
+	var m = createMechanicalBody({ kind: 'solenoid', x: 12, y: 15, axis: 'h', magnet: true });
+	m.magStrength = 2; m.vel = 3; m.friction = 0; m.damping = 0;
+	bodies.push(m);
+`);
+simulate(25);
+const bClosed = getRef('bodies')[0];
+assert(bClosed.lastFcoil * bClosed.vel < 0, `closed loop: Lenz drag F·v < 0 (F=${bClosed.lastFcoil.toFixed(2)}, v=${bClosed.vel})`);
+runCode(`
+	grid.fill(1);
+	for (let y = 13; y <= 17; y++) for (let x = 4; x <= 26; x++) grid[y * GRID_W + x] = 0;
+	buildNetworks(); seedAir();
+	manualWires.length = 0; manualBatteries.length = 0; lamps.length = 0;
+	bodies.length = 0;
+	var m = createMechanicalBody({ kind: 'solenoid', x: 12, y: 15, axis: 'h', magnet: true });
+	m.magStrength = 2; m.vel = 3; m.friction = 0; m.damping = 0;
+	bodies.push(m);
+`);
+simulate(25);
+const bOpen = getRef('bodies')[0];
+const openFv = (bOpen.lastFcoil || 0) * bOpen.vel;
+assert(Math.abs(openFv) < 1e-6, `open loop: no Lenz drag |F·v| ≈ 0 (got ${Math.abs(openFv).toExponential(2)})`);
+
+// ---- 23. bat-to-solenoid coupling (battery ON vs open loop) ----
+console.log('\n== Test 23: Bat→Solenoid coupling — energized rails act on solenoid, open does not ==');
+runCode(`loadScene('bat-to-solenoid');`);
+runCode(`bodies[0].vel = 0; for (let s = 0; s < 120; s++) { fieldSimulate(); fieldRelax(FIELD_SWEEPS_PER_FRAME); fieldPublish(); }`);
+const bOn = getRef('bodies')[0];
+assert(Math.abs(bOn.lastFcoil) > 1e-4, `energized rails create a field that acts on the solenoid (|F|=${Math.abs(bOn.lastFcoil).toFixed(4)} N > 1e-4)`);
+runCode(`manualWires.length = 0; manualBatteries.length = 0; buildNetworks(); fieldV.fill(0); voltages.clear(); bodies[0].vel = 0; for (let s = 0; s < 120; s++) { fieldSimulate(); fieldRelax(FIELD_SWEEPS_PER_FRAME); fieldPublish(); }`);
+const bOff = getRef('bodies')[0];
+assert(Math.abs(bOff.lastFcoil) < 1e-4, `open loop (no wire current) => no magnetic force on the solenoid (|F|=${Math.abs(bOff.lastFcoil).toExponential(2)} < 1e-4)`);
+
+// ---- Translate acceptance criteria (DOCUMENTATION ONLY — not asserted) ----
+// Tracked future goal from 09-plan-solenoid-force-rebalance.md. The current
+// model has pressure ~30x magnetic, so a hard assertion would fail without a
+// separate force-rebalance pass (deferred by decision). Recorded here so the
+// bar is visible; requires its own rebalance task before it can be enforced:
+//   - battery ON  => magnet translates >= 1 cell within ~2000 frames
+//   - |vel| < 6 throughout the motion (no runaway / oscillation)
+//   - F_coil remains finite over the whole window
+// TODO(deferred): add a force-rebalance pass, then promote this to a real test.
 
 console.log(`\n=== RESULTS: ${passCount} pass, ${failCount} fail ===`);
 process.exit(failCount === 0 ? 0 : 1);

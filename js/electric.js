@@ -758,6 +758,12 @@ function fieldPublish() {
 		let Bz = 0, dBx = 0, dBy = 0, elecP = 0, maxI = 0, bridgeI = 0;
 		for (let ei = 0; ei < fieldEdges.length; ei++) {
 			const e = fieldEdges[ei];
+			// edgeIsSelf() only excludes the armature BRIDGE edge (the conductor
+			// cell the body physically spans). Edges merely ADJACENT to the body
+			// cells are intentionally kept: a magnet legitimately feels the field
+			// of nearby current, including its own driving coil — this is by
+			// design (Case-A motor force comes from the rails, not the bridge),
+			// and is NOT a self-force bug to be "fixed" without a physics reason.
 			if (edgeIsSelf(e, mag)) {
 				bridgeI = e.I;
 				continue;
@@ -784,16 +790,21 @@ function fieldPublish() {
 		const eta = mag.efficiency != null ? mag.efficiency : 0.85;
 		mag.lastHeat = Math.abs(elecP) * Math.max(0, 1 - eta);
 	}
-	for (let i = 0; i < Ngrid; i++) {
-		const cx = (i % GRID_W) + 0.5, cy = ((i / GRID_W) | 0) + 0.5;
-		let Bz = 0;
-		for (let ei = 0; ei < fieldEdges.length; ei++) {
-			const e = fieldEdges[ei];
-			const rx = cx - e.mx, ry = cy - e.my;
-			if (rx * rx + ry * ry > r2max) continue;
-			Bz += K_B * e.I * magKernelG(e.dlx, e.dly, rx, ry, sig2);
+ 	// Bz overlay is only needed in the B-field view; skip the O(N·E) fill in
+	// other views. Switching to B-field triggers a recompute (sim loop guard or
+	// the setColorView one-shot).
+	if (colorView === 'bfield') {
+		for (let i = 0; i < Ngrid; i++) {
+			const cx = (i % GRID_W) + 0.5, cy = ((i / GRID_W) | 0) + 0.5;
+			let Bz = 0;
+			for (let ei = 0; ei < fieldEdges.length; ei++) {
+				const e = fieldEdges[ei];
+				const rx = cx - e.mx, ry = cy - e.my;
+				if (rx * rx + ry * ry > r2max) continue;
+				Bz += K_B * e.I * magKernelG(e.dlx, e.dly, rx, ry, sig2);
+			}
+			fieldBz[i] = Bz;
 		}
-		fieldBz[i] = Bz;
 	}
 	let residual = 0;
 	for (let ei = 0; ei < fieldEdges.length; ei++) residual += fieldEdges[ei].E * fieldEdges[ei].I;
@@ -899,7 +910,7 @@ function simTick(now) {
 	lastSimT = now;
 	const dt = (realDt * TIME_SCALE) / HEAT_SWEEPS_PER_FRAME;  // s per air sub-step
 	if (electricActive()) {
-		if (magnetList().length) fieldSimulate(); // rebuild edges/EMF/Case-A cells
+		if (magnetList().length || colorView === 'bfield') fieldSimulate(); // rebuild edges/EMF/Case-A cells + Bz overlay
 		fieldRelax(FIELD_SWEEPS_PER_FRAME);
 		fieldPublish();   // also refreshes heatSource every frame
 	} else if (heatAirActive()) {
