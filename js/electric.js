@@ -995,13 +995,16 @@ function fieldSimulate() {
 		}
 	}
 
-	// Magnet-induced (motional) EMF on the edge registry. Both engines fill
-	// the same `e.E`; they differ in the coupling kernel's range and in the
-	// power projection (see magApplyEmfDiffusion).
+	// Magnet-induced (motional) EMF on the edge registry. The 'direct' engine
+	// uses the legacy hard-cutoff kernel; both 'ar' and 'hy3' use Ar's
+	// analytic (smoothly windowed) kernel — for 'hy3' the B-field and the
+	// magnet force come from the screened-Poisson solve, but the EMF
+	// injection is engine-shared. Phase 2 will factor this into a single
+	// magInjectEmfAnalytic(mags) helper; today the call sites are the same.
 	if (mags.length) {
-		if (magEngine === 'direct') magApplyEmfDirect(mags);
-		else if (magEngine === 'hy3') { /* Phase 1: no e.E injection; see Phase 2 */ }
-		else {
+		if (magEngine === 'direct') {
+			magApplyEmfDirect(mags);
+		} else {
 			magBuildEdgeCells();
 			magBuildCoupling(mags);
 			magApplyEmfDiffusion(mags);
