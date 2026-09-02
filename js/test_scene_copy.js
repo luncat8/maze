@@ -59,7 +59,7 @@ const sandbox = {
 };
 vm.createContext(sandbox);
 
-const files = ['state.js', 'maze.js', 'network.js', 'render.js', 'air.js', 'electric.js', 'ui.js'];
+const files = ['state.js', 'maze.js', 'network.js', 'render.js', 'air.js', 'electric.js', 'magfield_diffusion.js', 'ui.js'];
 const jsDir = __dirname;
 for (const f of files) {
 	const src = fs.readFileSync(path.join(jsDir, f), 'utf8');

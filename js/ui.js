@@ -685,27 +685,79 @@ els.cooling.onchange = () => { coolingEnabled = els.cooling.checked; startSimLoo
 // medium resistance slider.
 const engineSel = document.getElementById('engineSel');
 if (engineSel) engineSel.onchange = () => { activeEngine = engineSel.value; recompute(); updateStatus(); };
-// Magnetic engine selector: 'diffusion' (persistent relaxed Bz) vs 'direct'
-// (legacy per-frame Biot–Savart sum). Switching drops the solver state so the
-// two engines never share a half-warm field.
+// Magnetic engine selector: 'ar' (default analytic diffusion), 'hy3'
+// (screened-Poisson, separate file), 'direct' (legacy per-frame Biot–Savart
+// sum). Switching drops the solver state so the engines never share a
+// half-warm field. Also re-binds the B-range slider between MAG_RANGE (Ar,
+// cells) and MAG_LAMBDA (Hy3, screened-Poisson decay), and toggles the
+// "Magnets emit B" (Ar) vs "Magnets inject dipoles" (Hy3) controls.
 const magEngineSel = document.getElementById('magEngineSel');
-if (magEngineSel) magEngineSel.onchange = () => {
+const magRangeUnit = document.getElementById('magRangeUnit');
+const magEmitAllLbl = document.getElementById('magEmitAllLbl');
+const magDipolesLbl = document.getElementById('magDipolesLbl');
+const magDipolesChk = document.getElementById('magDipoles');
+
+function magEngineOnChange() {
 	magEngine = magEngineSel.value;
+	const slider = document.getElementById('magRange');
+	const readout = document.getElementById('magRangeVal');
+	if (magEngine === 'hy3') {
+		slider.min = 0.02; slider.max = 1; slider.step = 0.01;
+		const v = +MAG_LAMBDA.toFixed(2);
+		slider.value = v;
+		if (readout) readout.textContent = v.toFixed(2);
+		if (magRangeUnit) magRangeUnit.textContent = 'λ';
+		if (magEmitAllLbl) magEmitAllLbl.hidden = true;
+		if (magDipolesLbl) magDipolesLbl.hidden = false;
+	} else if (magEngine === 'ar') {
+		slider.min = 2; slider.max = 16; slider.step = 1;
+		slider.value = MAG_RANGE;
+		if (readout) readout.textContent = MAG_RANGE;
+		if (magRangeUnit) magRangeUnit.textContent = 'cells';
+		if (magEmitAllLbl) magEmitAllLbl.hidden = false;
+		if (magDipolesLbl) magDipolesLbl.hidden = true;
+	} else { // 'direct'
+		slider.min = 2; slider.max = 16; slider.step = 1;
+		slider.value = MAG_RANGE;
+		if (readout) readout.textContent = MAG_RANGE;
+		if (magRangeUnit) magRangeUnit.textContent = 'cells';
+		if (magEmitAllLbl) magEmitAllLbl.hidden = true;
+		if (magDipolesLbl) magDipolesLbl.hidden = true;
+	}
 	magReset();
 	recompute();
 	updateStatus();
-	logger('Magnetic engine: ' + (magEngine === 'direct' ? 'direct Biot–Savart sum (obsolete)' : 'Bz diffusion'), 'sys');
-};
+	const tag = magEngine === 'direct' ? 'direct Biot–Savart sum (obsolete)'
+	          : magEngine === 'hy3'   ? 'Hy3 screened-Poisson'
+	          :                          'Ar analytic diffusion';
+	logger('Magnetic engine: ' + tag, 'sys');
+}
+if (magEngineSel) {
+	magEngineSel.value = magEngine;
+	magEngineSel.onchange = magEngineOnChange;
+	magEngineOnChange(); // sync slider + control visibility to the current default
+}
 const magRangeSlider = document.getElementById('magRange');
 const magRangeVal = document.getElementById('magRangeVal');
 if (magRangeSlider) magRangeSlider.oninput = () => {
-	MAG_RANGE = +magRangeSlider.value;
-	if (magRangeVal) magRangeVal.textContent = magRangeSlider.value;
-	if (magEngine === 'diffusion') startSimLoop();
+	const v = +magRangeSlider.value;
+	if (magEngine === 'hy3') {
+		MAG_LAMBDA = v;
+		if (typeof magDiffusionReset === 'function') magDiffusionReset();
+	} else {
+		MAG_RANGE = v;
+	}
+	if (magRangeVal) magRangeVal.textContent = magEngine === 'hy3' ? v.toFixed(2) : v;
+	startSimLoop();
 };
 const magEmitChk = document.getElementById('magEmitAll');
 if (magEmitChk) magEmitChk.onchange = () => {
 	magEmitAll = magEmitChk.checked;
+	if (magnetList().length) { fieldSimulate(); startSimLoop(); }
+};
+if (magDipolesChk) magDipolesChk.onchange = () => {
+	MAG_DIPOLES = magDipolesChk.checked;
+	if (typeof magDiffusionReset === 'function') magDiffusionReset();
 	if (magnetList().length) { fieldSimulate(); startSimLoop(); }
 };
 const metalRSlider = document.getElementById('metalR');

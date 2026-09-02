@@ -161,16 +161,21 @@ let K_B = 40;           // magnetic kernel gain (slider)
 const SIGMA_B = 0.5;    // soft-core radius (cells)
 const MAG_RMAX = 8;     // kernel cutoff (cells) — LEGACY ('direct') engine only
 
-// Magnetic engine selection. Mirrors the electric `activeEngine` split:
-//  'diffusion' (default) — Bz is persistent solver state, relaxed by
-//    red-black Gauss–Seidel every frame from a local source: the discrete
+// Magnetic engine selection. Three engines are selectable:
+//  'ar' (default) — Analytic diffusion: Bz is persistent solver state, relaxed
+//    by red-black Gauss–Seidel every frame from a local source: the discrete
 //    Laplacian of the MAG_RANGE-windowed Biot–Savart field, so the relaxed
 //    field IS that analytic field, smoothly tapered instead of hard-cut.
 //    Warm-started, O(cells) per sweep, no cutoff discontinuity.
+//  'hy3' — Hy3 screened-Poisson (separate file: js/magfield_diffusion.js).
+//    Solves (∇² − λ²) Bz = S for the curl of J + (when MAG_DIPOLES) each
+//    magnet's own dipole. Range is λ (1/λ = decay length), no hard cutoff.
+//    Warm-started, with self-field cancellation so a magnet exerts no force on
+//    itself but still feels wires and other magnets.
 //  'direct' — OBSOLETE legacy path: per-frame Biot–Savart summation over
 //    every current edge for every magnet, with a hard MAG_RMAX cutoff. Kept
 //    selectable for regression/comparison; no new features planned.
-let magEngine = 'diffusion';
+let magEngine = 'ar';
 // Field radius (cells) of the diffused engine: the kernel is tapered smoothly
 // to zero here instead of being hard-cut (the legacy MAG_RMAX jump). Measured
 // on the solenoid scenes: the net force is a small residue of large cancelling
@@ -180,6 +185,10 @@ let MAG_RANGE = 8;
 const MAG_SWEEPS_PER_FRAME = 50;      // B relaxation steps advanced each frame
 let magEmitAll = false;               // master switch: every magnet emits its dipole field
 const MAG_EMIT_R = 3;                 // dipole source window (cells) around a body
+
+// Hy3 engine tuning ('hy3' in magEngine). See js/magfield_diffusion.js.
+let MAG_LAMBDA = 0.15;                // screened-Poisson decay (1/λ = decay length in cells)
+let MAG_DIPOLES = false;              // 'hy3': magnets also inject their own dipole source
 
 function bodyMoveAxis(b) { return b.moveAxis || b.axis; }
 function isCaseA(b) { return !!b.magnet && b.axis && bodyMoveAxis(b) !== b.axis; }
@@ -495,7 +504,9 @@ function updateStatus(x, y) {
 		}
 	}
   const engineName = activeEngine === 'field' ? 'Field' : 'Circuit (obsolete)';
-  const magName = magEngine === 'direct' ? 'Direct (obsolete)' : 'Diffusion';
+  const magName = magEngine === 'direct' ? 'Direct (obsolete)'
+                : magEngine === 'hy3'     ? 'Diffusion-Hy3 (screened)'
+                :                           'Diffusion-Ar (analytic)';
   const viewName = colorView === 'net' ? 'Net' : colorView === 'electric' ? 'Electric' : colorView === 'voltage' ? 'Voltage' : colorView === 'heat' ? 'Heat' : colorView === 'pressure' ? 'Pressure' : colorView === 'bfield' ? 'B-field' : 'Light';
   statusBar.textContent = `Tool: ${tn}   |   Cell: ${ci}   |   Type: ${ti}${extra}   |   Net: ${selectedColor}   |   View: ${viewName}   |   Engine: ${engineName}   |   Mag: ${magName}   |   T: ${tStr}   |   P: ${pStr}`;
 }
