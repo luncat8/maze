@@ -310,6 +310,37 @@ runCode(`
 	fieldSimulate();
 `);
 settle(60);
+// 5a — default (diffusion) engine: the relaxed field must reproduce the same
+// analytic kernel up to its smooth MAG_RANGE taper. Exact equality is the
+// LEGACY contract, checked in 5b with the engine pinned to 'direct' (the same
+// way test_electric_demo.js pins activeEngine='circuit' for the nodal engine).
+runCode(`
+	var mag = pistons[0];
+	var c = bodyCenter(mag);
+	var sig2 = SIGMA_B * SIGMA_B;
+	function kernelSum(cut) {
+		var Bz = 0;
+		for (var ei = 0; ei < fieldEdges.length; ei++) {
+			var e = fieldEdges[ei];
+			if (edgeIsSelf(e, mag)) continue;
+			var rx = c.x - e.mx, ry = c.y - e.my;
+			var r2 = rx * rx + ry * ry;
+			if (cut && r2 > MAG_RMAX * MAG_RMAX) continue;
+			var w = cut ? 1 : magWindow(Math.sqrt(r2));
+			if (!w) continue;
+			Bz += K_B * e.I * w * magKernelG(e.dlx, e.dly, rx, ry, sig2);
+		}
+		return Bz;
+	}
+	globalThis.__arb = { lastBz: mag.lastBz, analytic: kernelSum(false), legacySum: kernelSum(true), F: mag.lastFcoil };
+`);
+const arb = sandbox.__arb;
+assert(Number.isFinite(arb.F), 'L-shaped loop produces a well-defined force');
+assert(Math.abs(arb.lastBz - arb.analytic) < 0.05 * Math.abs(arb.analytic) + 1e-9,
+	`diffused Bz reproduces the windowed analytic kernel (num=${arb.lastBz.toFixed(4)} an=${arb.analytic.toFixed(4)})`);
+// 5b — LEGACY engine: lastBz IS the raw Biot–Savart sum, to the last bit.
+runCode(`magEngine = 'direct'; magReset(); fieldSimulate();`);
+settle(5);
 runCode(`
 	var mag = pistons[0];
 	var c = bodyCenter(mag);
@@ -321,11 +352,12 @@ runCode(`
 		var rx = c.x - e.mx, ry = c.y - e.my;
 		Bz += K_B * e.I * magKernelG(e.dlx, e.dly, rx, ry, sig2);
 	}
-	globalThis.__arb = { lastBz: mag.lastBz, analytic: Bz, F: mag.lastFcoil };
+	globalThis.__arb2 = { lastBz: mag.lastBz, analytic: Bz, engine: magEngine };
+	magEngine = 'diffusion'; magReset(); fieldSimulate();
 `);
-const arb = sandbox.__arb;
-assert(Math.abs(arb.lastBz - arb.analytic) < 1e-8, `Bz matches analytic kernel (num=${arb.lastBz.toFixed(5)} an=${arb.analytic.toFixed(5)})`);
-assert(Number.isFinite(arb.F), 'L-shaped loop produces a well-defined force');
+const arb2 = sandbox.__arb2;
+assert(arb2.engine === 'direct', `Test 5b ran on the legacy engine (got ${arb2.engine})`);
+assert(Math.abs(arb2.lastBz - arb2.analytic) < 1e-8, `LEGACY Bz matches analytic kernel (num=${arb2.lastBz.toFixed(5)} an=${arb2.analytic.toFixed(5)})`);
 
 // ---- 6. Case A armature bridge ----
 console.log('\n== Test 6: Case A armature bridge ==');

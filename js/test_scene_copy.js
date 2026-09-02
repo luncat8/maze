@@ -113,6 +113,17 @@ for (const name of scenes) {
 	assert(before === after, `map round-trip for "${name}"\n     before=${before}\n     after =${after}`);
 }
 
+
+console.log('\n== Magnetic `emit` token round-trip ==');
+runCode(`loadScene('solenoid-lab'); pistons[0].emit = true; pistons[1].emit = false;`);
+const emitText = evalExpr('serializeSceneMap()');
+runCode(`loadMapFromText(${JSON.stringify(emitText)});`);
+assert(evalExpr('bodies[0].emit') === true, 'solenoid with emit:true round-trips as emit');
+assert(evalExpr('bodies[1].emit') === false, 'solenoid without emit token stays emit:false');
+const noEmitText = emitText.split('\n').map(l => l.startsWith('solenoid ') ? l.replace(/ emit/g, '') : l).join('\n');
+runCode(`loadMapFromText(${JSON.stringify(noEmitText)});`);
+assert(evalExpr('bodies[0].emit') === false, 'old scene without emit token loads emit:false');
+
 console.log('\n== Full-state round trip (fields within tolerance) ==');
 function arrMaxDiff(a, b) { let d = 0; for (let i = 0; i < a.length; i++) d = Math.max(d, Math.abs(a[i] - b[i])); return d; }
 function mapMaxDiff(aE, bE) {

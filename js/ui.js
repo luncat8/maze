@@ -26,12 +26,13 @@ function setColorView(v) {
 	if (bf) bf.classList.toggle('active', v === 'bfield');
 	if (v === 'bfield') {
 		// Populate the Bz overlay immediately, even if the unified sim loop is
-		// idle: rebuild edges/systems, relax the current field, then recompute so
+		// idle: rebuild edges/systems, relax the current field, then publish so
 		// the overlay reflects the live current (wire Bz shows with no magnet).
 		if (magnetList().length || electricActive()) {
 			fieldSimulate();
 			fieldRelax(FIELD_SWEEPS_PER_FRAME);
 			fieldSimulate();
+			fieldPublish();
 		}
 	}
 	render();
@@ -502,6 +503,7 @@ document.getElementById('clearBtn').onclick = () => {
 				else if (t.startsWith('pos:')) b.pos = +t.slice(4);
 				else if (t.startsWith('friction:')) b.friction = +t.slice(9);
 				else if (t.startsWith('mag:')) b.magStrength = +t.slice(4);
+				else if (t === 'emit') b.emit = true;
 				else if (t.startsWith('vel:')) b.vel = +t.slice(4);
 			}
 		};
@@ -571,7 +573,7 @@ document.getElementById('clearBtn').onclick = () => {
 		lamps.forEach(l => L.push('lamp ' + l.x + ',' + l.y + (l.limited ? '' : ' U') + ' E:' + Math.round(l.energy)));
 		switches.forEach(s => L.push('switch ' + s.x + ',' + s.y + ' ' + (s.value ? 'closed' : 'open') + (s.limited ? '' : ' U')));
 		pumps.forEach(p => L.push('pump ' + p.x + ',' + p.y + ' dir:' + p.dir));
-		pistons.forEach(p => L.push((p.magnet ? 'solenoid ' : 'piston ') + p.x + ',' + p.y + ' axis:' + p.axis + ' move:' + p.moveAxis + ' pos:' + p.pos + ' friction:' + p.friction + (p.magStrength != null ? ' mag:' + p.magStrength : '') + ' vel:' + p.vel + (p.limited ? '' : ' U')));
+		pistons.forEach(p => L.push((p.magnet ? 'solenoid ' : 'piston ') + p.x + ',' + p.y + ' axis:' + p.axis + ' move:' + p.moveAxis + ' pos:' + p.pos + ' friction:' + p.friction + (p.magStrength != null ? ' mag:' + p.magStrength : '') + (p.emit ? ' emit' : '') + ' vel:' + p.vel + (p.limited ? '' : ' U')));
 		heatSinks.forEach(h => L.push('heatsink ' + h.x + ',' + h.y));
 		airSources.forEach(s => L.push('airsrc ' + s.x + ',' + s.y + ' rate:' + s.rate + ' temp:' + s.temp));
 		airSinks.forEach(s => L.push('airsink ' + s.x + ',' + s.y + ' rate:' + s.rate));
@@ -683,6 +685,29 @@ els.cooling.onchange = () => { coolingEnabled = els.cooling.checked; startSimLoo
 // medium resistance slider.
 const engineSel = document.getElementById('engineSel');
 if (engineSel) engineSel.onchange = () => { activeEngine = engineSel.value; recompute(); updateStatus(); };
+// Magnetic engine selector: 'diffusion' (persistent relaxed Bz) vs 'direct'
+// (legacy per-frame Biot–Savart sum). Switching drops the solver state so the
+// two engines never share a half-warm field.
+const magEngineSel = document.getElementById('magEngineSel');
+if (magEngineSel) magEngineSel.onchange = () => {
+	magEngine = magEngineSel.value;
+	magReset();
+	recompute();
+	updateStatus();
+	logger('Magnetic engine: ' + (magEngine === 'direct' ? 'direct Biot–Savart sum (obsolete)' : 'Bz diffusion'), 'sys');
+};
+const magRangeSlider = document.getElementById('magRange');
+const magRangeVal = document.getElementById('magRangeVal');
+if (magRangeSlider) magRangeSlider.oninput = () => {
+	MAG_RANGE = +magRangeSlider.value;
+	if (magRangeVal) magRangeVal.textContent = magRangeSlider.value;
+	if (magEngine === 'diffusion') startSimLoop();
+};
+const magEmitChk = document.getElementById('magEmitAll');
+if (magEmitChk) magEmitChk.onchange = () => {
+	magEmitAll = magEmitChk.checked;
+	if (magnetList().length) { fieldSimulate(); startSimLoop(); }
+};
 const metalRSlider = document.getElementById('metalR');
   const metalRVal = document.getElementById('metalRVal');
   if (metalRSlider) metalRSlider.oninput = () => {

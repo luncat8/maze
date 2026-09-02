@@ -193,6 +193,19 @@
 					<option value="circuit">Circuit (nodal, obsolete)</option>
 				</select>
 			</label>
+			<label class="ctrl" title="Diffusion relaxes a persistent Bz field (Poisson, ∇²B=S from a windowed Biot–Savart source) a few sweeps per frame: smooth, warm-started, cheap. Direct is the legacy per-frame Biot–Savart sum with a hard 8-cell cutoff — kept for comparison, no new features.">Magnetics:
+				<select id="magEngineSel">
+					<option value="diffusion">B diffusion</option>
+					<option value="direct">B direct sum (obsolete)</option>
+				</select>
+			</label>
+			<label class="ctrl" title="Radius of the diffused magnetic field, in cells: the kernel tapers smoothly to zero here (no hard cutoff jump). Larger = longer reach (16 ≈ whole grid); smaller = tighter, more 2D-looking coupling but weaker net force on centred magnets.">B range:
+				<input type="range" id="magRange" min="2" max="16" step="1" value="8">
+				<span id="magRangeVal">8</span> cells
+			</label>
+			<label class="ctrl" title="Let every magnet also emit its own dipole field (⊙/⊗), so magnets push on each other and the B-field view shows their dipoles. Per-item override: the Emit B checkbox on a magnet piston.">
+				<input type="checkbox" id="magEmitAll"> Magnets emit B
+			</label>
 			<label class="ctrl">Metal R:
 				<input type="range" id="metalR" min="1" max="200" step="1" value="20">
 				<span id="metalRVal">20</span> Ω
@@ -333,6 +346,7 @@
 			<div data-show="magnet">
 				<div class="prop-sub">Magnet</div>
 				<label class="ctrl"><span>m (dipole)</span><span class="ctrl-val" data-bind="magHead"></span><input type="range" data-input="magStrength" min="-5" max="5" step="0.1" value="1"></label>
+				<label class="ctrl" title="This magnet also emits its own dipole field, so it couples to other magnets (and shows up in the B-field view). Diffusion engine only."><span>Emit B</span><input type="checkbox" data-input="emit"></label>
 				<label class="ctrl"><span>R_arm (Ω)</span><span class="ctrl-val" data-bind="rArmHead"></span><input type="range" data-input="R_arm" min="0.2" max="20" step="0.1" value="2"></label>
 				<label class="ctrl"><span>Efficiency (%)</span><span class="ctrl-val" data-bind="etaHead"></span><input type="range" data-input="efficiency" min="0" max="100" step="1" value="85"></label>
 				<div class="prop-row"><span>Bz</span><span data-bind="bz"></span></div>

@@ -379,6 +379,511 @@ function edgeIsSelf(edge, body) {
 	return ha && hb;
 }
 
+// ---- Magnetic field: two interchangeable solvers -------------------------
+// Same toy model (in-plane current elements ⇒ out-of-plane Bz), two ways to
+// evaluate it. Selected by `magEngine` (`js/state.js`), like `activeEngine`
+// does for electricity.
+//
+// 'diffusion' (default) — Bz is persistent solver state, not a per-frame sum.
+//   The kernel g = (dl×r)/r² is harmonic away from the filament, so Bz is the
+//   solution of the Poisson problem  ∇²Bz = −2πK_B(∇×J)_z  (σ→0). We build
+//   ψ = Σ_e K_B·I_e·w(|r−m_e|)·g_σ, the analytic Biot–Savart field tapered by a
+//   compact C¹ window w (see magWindow), inject S = −∇²_h ψ over the window
+//   discs, and advance the field by red-black Gauss–Seidel on
+//        ∇²Bz = S,      Bz = 0 at the grid border
+//   a fixed number of sweeps per frame, warm-started from the previous frame.
+//   Because ψ itself vanishes at the border, the relaxed field IS ψ — the
+//   analytic field, smoothly tapered to zero at MAG_RANGE — not an
+//   approximation of it (measured 0.43 % at a point, 1.98 % worst over a
+//   channel; js/test_magdiff.js tests 2 and 10).
+//   Consequences: no zero-and-recompute (no flicker), no hard cutoff (the
+//   legacy `r² > MAG_RMAX²` jump becomes a smooth taper), the B-field view is
+//   free (it *is* the solver state), and the per-frame cost is O(edges) source
+//   assembly + O(cells)·sweeps + O(magnets × MAG_RANGE²) coupling — the last
+//   term replaces the legacy O(magnets × edges).
+//
+// 'direct' — OBSOLETE legacy path, kept selectable for regression: per-frame
+//   Biot–Savart summation over every current edge for every magnet, with the
+//   hard MAG_RMAX cutoff and the O(cells × edges) overlay fill. No new
+//   features planned; `js/test_solenoid.js` Test 5 pins the analytic-kernel
+//   contract against it.
+let magBzCoil = null;   // persistent Bz produced by wire currents
+let magBzDip = null;    // persistent Bz produced by self-emitting magnets
+let magSrc = null;      // Float64Array(N): Poisson source scratch
+let magPsi = null;      // Float64Array(N): analytic-Bz scratch for the source
+let magRed = null;      // checkerboard cell lists (built once)
+let magBlack = null;
+let magSrcCells = 0;    // nonzero source cells in the last build (0 ⇒ B must be 0)
+let magLastDv = 0;      // max |ΔBz| of the last magRelax call
+let magEdgeCells = null; // per-cell list of incident edges (rebuilt per fieldSimulate)
+let magCoupleStamp = 0;  // dedup stamp for magBuildCoupling
+
+const MAG_DIP_A = 1.25;  // dipole core radius (cells) of a self-emitting magnet
+const MAG_DIP_GAIN = 0.5; // dipole field scale, in units of K_B · magStrength
+
+// Smooth compact taper applied to the kernel — both the injected source and
+// the analytic coupling use it, so the relaxed field and the coupling are the
+// *same* function of position. That single-kernel discipline is what makes
+// Σ E·I = −F·v hold algebraically instead of needing a per-frame projection.
+// C¹ at r = MAG_RANGE: value *and* slope go to zero, so nothing jumps when an
+// edge crosses the radius — the discontinuity the legacy hard cut produces.
+function magWindow(r) {
+	const R = MAG_RANGE > 0 ? MAG_RANGE : MAG_RMAX;
+	const t = r / R;
+	if (t >= 1) return 0;
+	const u = 1 - t * t;
+	return u * u;
+}
+function magWindowGrad(r) {   // dw/dr
+	const R = MAG_RANGE > 0 ? MAG_RANGE : MAG_RMAX;
+	const t = r / R;
+	if (t >= 1) return 0;
+	return -4 * t * (1 - t * t) / R;
+}
+
+// Does this body emit its own dipole field? Per-item `emit` plus the GUI
+// master switch. Only magnets emit, and only the diffusion engine injects it.
+function magEmits(b) { return !!b.magnet && (!!b.emit || magEmitAll); }
+
+// Field of a plane-normal dipole of moment m, sampled at offset (dx,dy) in its
+// own plane: Bz = −C·m/(r²+a²)^{3/2}. This is the exact in-plane Bz of a 3D
+// point dipole (equatorial plane), softened at the core by `a` — and the ⊙/⊗
+// glyph the renderer already draws for magStrength is exactly this moment.
+function magDipBz(dx, dy, m) {
+	const a2 = MAG_DIP_A * MAG_DIP_A;
+	const den = dx * dx + dy * dy + a2;
+	return -K_B * MAG_DIP_GAIN * m * (a2 * MAG_DIP_A) / (den * Math.sqrt(den));
+}
+function magDipGrad(dx, dy, m) {
+	const a2 = MAG_DIP_A * MAG_DIP_A;
+	const den = dx * dx + dy * dy + a2;
+	const c = 3 * K_B * MAG_DIP_GAIN * m * (a2 * MAG_DIP_A) / (den * den * Math.sqrt(den));
+	return { gx: c * dx, gy: c * dy };
+}
+
+// The conductor edge a body physically spans (Case-A armature bridge). A body
+// must never be pushed by its own armature current, so the diffusion engine
+// drops these edges from the source entirely (it has no per-magnet variants of
+// the field, unlike the legacy per-magnet `edgeIsSelf` skip).
+function magSelfEdge(mag) {
+	const cells = bodyCells(mag);
+	for (let i = 0; i < cells.length; i++) {
+		const a = cells[i], ax = a % GRID_W, ay = (a / GRID_W) | 0;
+		for (let d = 0; d < 2; d++) {
+			const nx = ax + (d === 0 ? 1 : 0), ny = ay + (d === 0 ? 0 : 1);
+			if (nx >= GRID_W || ny >= GRID_H) continue;
+			const b = ny * GRID_W + nx;
+			if (cells.indexOf(b) < 0) continue;
+			const e = fieldEdgeMap.get(a + ':' + b);
+			if (e) return e;
+		}
+	}
+	return null;
+}
+
+// Per-cell index of incident edges, so a magnet only ever looks at the edges
+// near it: coupling cost becomes O(magnets × MAG_RANGE²) instead of the legacy
+// O(magnets × edges).
+function magBuildEdgeCells() {
+	const N = GRID_W * GRID_H;
+	if (!magEdgeCells || magEdgeCells.length !== N) magEdgeCells = new Array(N).fill(null);
+	else for (let i = 0; i < N; i++) if (magEdgeCells[i]) magEdgeCells[i].length = 0;
+	for (let ei = 0; ei < fieldEdges.length; ei++) {
+		const e = fieldEdges[ei];
+		if (!magEdgeCells[e.a]) magEdgeCells[e.a] = [];
+		magEdgeCells[e.a].push(e);
+		if (!magEdgeCells[e.b]) magEdgeCells[e.b] = [];
+		magEdgeCells[e.b].push(e);
+	}
+}
+
+// Build (once per frame) each magnet's list of {e, b} pairs: the edges inside
+// the coupling radius and b = ∂(w·g_e)/∂a, the directional derivative — along
+// the body's move axis — of that edge's *windowed* field, evaluated at the body
+// centre. This is exactly the gradient of the field the relaxation converges
+// to (the source injects ∇²_h of the same w·g), so force and EMF are two views
+// of one coupling and Σ E·I = −F·v closes algebraically. NOTE: the force is
+// taken from THIS analytic β, not from a finite difference of the relaxed grid
+// — in near-symmetric geometries the true gradient is a small residue of large
+// cancelling terms and a 1-cell stencil gets it wrong by orders of magnitude,
+// even in sign (js/test_magdiff.js test 10 measures both).
+// Both the induced EMF (magApplyEmfDiffusion) and the force (magSolveDiffusion)
+// read this list, so the kernel is evaluated once per nearby pair, not twice —
+// and cost is O(magnets × MAG_RANGE²), independent of the total edge count
+// (the legacy coupling was O(magnets × edges)).
+function magBuildCoupling(mags) {
+	const R = (MAG_RANGE > 0 ? MAG_RANGE : MAG_RMAX) + 1;
+	const r2max = R * R;
+	const sig2 = SIGMA_B * SIGMA_B;
+	const stamp = ++magCoupleStamp;
+	for (let mi = 0; mi < mags.length; mi++) {
+		const mag = mags[mi];
+		const self = magSelfEdge(mag);
+		const c = bodyCenter(mag), hat = bodyHat(mag);
+		const x0 = Math.max(0, Math.floor(c.x - R)), x1 = Math.min(GRID_W - 1, Math.ceil(c.x + R));
+		const y0 = Math.max(0, Math.floor(c.y - R)), y1 = Math.min(GRID_H - 1, Math.ceil(c.y + R));
+		const out = [];
+		for (let y = y0; y <= y1; y++) {
+			for (let x = x0; x <= x1; x++) {
+				const list = magEdgeCells[y * GRID_W + x];
+				if (!list) continue;
+				for (let k = 0; k < list.length; k++) {
+					const e = list[k];
+					if (e === self || e._cstamp === stamp) continue;
+					e._cstamp = stamp;
+					const rx = c.x - e.mx, ry = c.y - e.my;
+					const r2 = rx * rx + ry * ry;
+					if (r2 > r2max) continue;
+					const r = Math.sqrt(r2);
+					const w = magWindow(r);
+					if (!w) continue;
+					const gr = magKernelGrad(e.dlx, e.dly, rx, ry, sig2);
+					// d(w·g)/da = w·∂g/∂a + g·(dw/dr)(∂r/∂a)
+					let b = w * (gr.gx * hat.ax + gr.gy * hat.ay);
+					const dw = magWindowGrad(r);
+					if (dw && r > 1e-9) {
+						b += dw * ((rx * hat.ax + ry * hat.ay) / r) * magKernelG(e.dlx, e.dly, rx, ry, sig2);
+					}
+					if (b) out.push({ e: e, b: b });
+				}
+			}
+		}
+		mag._couple = out;
+		mag._selfEdge = self;
+	}
+}
+
+// Induced (motional) EMF — LEGACY shape, byte-identical to the pre-diffusion
+// inline loop: hard MAG_RMAX cutoff, no window, no power projection.
+function magApplyEmfDirect(mags) {
+	const sig2 = SIGMA_B * SIGMA_B;
+	const r2max = MAG_RMAX * MAG_RMAX;
+	for (let ei = 0; ei < fieldEdges.length; ei++) {
+		const e = fieldEdges[ei];
+		let E = 0;
+		for (let mi = 0; mi < mags.length; mi++) {
+			const mag = mags[mi];
+			if (edgeIsSelf(e, mag)) continue;
+			const c = bodyCenter(mag);
+			const rx = c.x - e.mx, ry = c.y - e.my;
+			if (rx * rx + ry * ry > r2max) continue;
+			const hat = bodyHat(mag);
+			const gxy = magKernelGrad(e.dlx, e.dly, rx, ry, sig2);
+			const dgda = gxy.gx * hat.ax + gxy.gy * hat.ay;
+			E += -(mag.magStrength || 1) * K_B * dgda * (mag.vel || 0);
+		}
+		e.E = E;
+	}
+}
+
+// Induced EMF for the diffusion engine: the same physical term as the legacy
+// engine, but the coupling is (a) tapered smoothly by MAG_RANGE instead of
+// hard-cut at MAG_RMAX, so nothing jumps when an edge crosses the radius, and
+// (b) gathered through the per-cell edge index, so the cost is
+// O(magnets × MAG_RANGE²) instead of O(magnets × edges).
+//
+// Force and EMF share one coupling coefficient b_e = ∂(w·g_e)/∂a, which makes
+// the lossless-coupling identity close *algebraically*:
+//     F = m·K_B·Σ_e I_e b_e        ⇒   Σ_e E_e I_e = −m·K_B·v Σ_e I_e b_e = −F·v
+// (that is what `magEnergyResidual` measures; see test_magdiff.js).
+function magApplyEmfDiffusion(mags) {
+	for (let mi = 0; mi < mags.length; mi++) {
+		const mag = mags[mi];
+		const m = mag.magStrength != null ? mag.magStrength : 1;
+		const v = mag.vel || 0;
+		const cp = mag._couple;
+		if (!m || !v || !cp) continue;
+		const k = -m * K_B * v;
+		for (let i = 0; i < cp.length; i++) cp[i].e.E += k * cp[i].b;
+	}
+}
+
+function magBuildChecker() {
+	magRed = []; magBlack = [];
+	for (let y = 1; y < GRID_H - 1; y++) {
+		for (let x = 1; x < GRID_W - 1; x++) {
+			(((x + y) & 1) ? magBlack : magRed).push(y * GRID_W + x);
+		}
+	}
+}
+
+// Assemble the Poisson source of the current-generated field:
+//     S = −∇²_h( Σ_e K_B·I_e·g_σ(e)·w(|r−m_e|) )
+// i.e. the discrete Laplacian of the very same windowed analytic field the
+// coupling uses, so the relaxed solution reproduces it (the Dirichlet border is
+// already inside the field's compact support). The soft core σ keeps the source
+// bounded; the window keeps it compact. One Laplacian per touched cell — never
+// per edge, or overlapping stencils would double-count the shared cells.
+function magBuildCoilSource() {
+	const N = GRID_W * GRID_H;
+	if (!magSrc || magSrc.length !== N) { magSrc = new Float64Array(N); magPsi = new Float64Array(N); }
+	magSrc.fill(0); magPsi.fill(0);
+	const R = (MAG_RANGE > 0 ? MAG_RANGE : MAG_RMAX) + 1;
+	const r2max = R * R;
+	const sig2 = SIGMA_B * SIGMA_B;
+	const selfKeys = new Set();
+	const mags = magnetList();
+	for (let mi = 0; mi < mags.length; mi++) { const e = magSelfEdge(mags[mi]); if (e) selfKeys.add(e.key); }
+	for (let ei = 0; ei < fieldEdges.length; ei++) {
+		const e = fieldEdges[ei];
+		const I = e.I;
+		if (!I || selfKeys.has(e.key)) continue;
+		const x0 = Math.max(0, Math.floor(e.mx - R)), x1 = Math.min(GRID_W - 1, Math.ceil(e.mx + R));
+		const y0 = Math.max(0, Math.floor(e.my - R)), y1 = Math.min(GRID_H - 1, Math.ceil(e.my + R));
+		const kg = K_B * I;
+		for (let y = y0; y <= y1; y++) {
+			const ry = y + 0.5 - e.my, ry2 = ry * ry;
+			for (let x = x0; x <= x1; x++) {
+				const rx = x + 0.5 - e.mx;
+				const r2 = rx * rx + ry2;
+				if (r2 > r2max) continue;
+				const w = magWindow(Math.sqrt(r2));
+				if (!w) continue;
+				magPsi[y * GRID_W + x] += kg * w * (e.dlx * ry - e.dly * rx) / (r2 + sig2);
+			}
+		}
+	}
+	let n = 0;
+	for (let y = 1; y < GRID_H - 1; y++) {
+		for (let x = 1; x < GRID_W - 1; x++) {
+			const i = y * GRID_W + x;
+			if (magPsi[i] === 0 && magPsi[i - 1] === 0 && magPsi[i + 1] === 0 &&
+				magPsi[i - GRID_W] === 0 && magPsi[i + GRID_W] === 0) continue;
+			const s = -(-4 * magPsi[i] + magPsi[i - 1] + magPsi[i + 1] + magPsi[i - GRID_W] + magPsi[i + GRID_W]);
+			if (s === 0) continue;
+			magSrc[i] = s;
+			n++;
+		}
+	}
+	magSrcCells = n;
+}
+
+// Source of the self-emitting magnets' dipole field, injected the same way
+// (S = −∇²_h of the analytic dipole). ∇²(r²+a²)^{-3/2} = (9r²−6a²)/(r²+a²)^{7/2}
+// is a compact negative core plus a positive ring, so a ±MAG_EMIT_R window is
+// enough to reproduce the 1/r³ far field.
+function magBuildDipSource(mags) {
+	const N = GRID_W * GRID_H;
+	if (!magSrc || magSrc.length !== N) { magSrc = new Float64Array(N); magPsi = new Float64Array(N); }
+	magSrc.fill(0);
+	let n = 0;
+	for (let mi = 0; mi < mags.length; mi++) {
+		const mag = mags[mi];
+		if (!magEmits(mag)) continue;
+		const m = mag.magStrength != null ? mag.magStrength : 1;
+		if (!m) continue;
+		const c = bodyCenter(mag);
+		const R = MAG_EMIT_R;
+		const x0 = Math.max(1, Math.floor(c.x - 0.5) - R), x1 = Math.min(GRID_W - 2, Math.floor(c.x - 0.5) + R + 1);
+		const y0 = Math.max(1, Math.floor(c.y - 0.5) - R), y1 = Math.min(GRID_H - 2, Math.floor(c.y - 0.5) + R + 1);
+		const f = (x, y) => magDipBz(x + 0.5 - c.x, y + 0.5 - c.y, m);
+		for (let y = y0; y <= y1; y++) {
+			for (let x = x0; x <= x1; x++) {
+				const i = y * GRID_W + x;
+				const s = -(-4 * f(x, y) + f(x - 1, y) + f(x + 1, y) + f(x, y - 1) + f(x, y + 1));
+				if (s === 0) continue;
+				if (magSrc[i] === 0) n++;
+				magSrc[i] += s;
+			}
+		}
+	}
+	magSrcCells = n;
+}
+
+// Red-black Gauss–Seidel on ∇²B = S over the whole grid (Dirichlet 0 on the
+// border ring, which the windowed source never reaches). Same scheme as
+// fieldRelax. Returns the largest per-cell change this call.
+function magRelax(buf, sweeps) {
+	if (!magRed) magBuildChecker();
+	let maxc = 0;
+	for (let it = 0; it < sweeps; it++) {
+		for (let pass = 0; pass < 2; pass++) {
+			const list = pass === 0 ? magRed : magBlack;
+			for (let li = 0; li < list.length; li++) {
+				const i = list[li];
+				const nv = (buf[i - 1] + buf[i + 1] + buf[i - GRID_W] + buf[i + GRID_W] + magSrc[i]) * 0.25;
+				const d = Math.abs(nv - buf[i]);
+				if (d > maxc) maxc = d;
+				buf[i] = nv;
+			}
+		}
+	}
+	magLastDv = maxc;
+	return maxc;
+}
+
+// Bilinear sample of a cell-centred field at (x,y) in cell-centre coordinates
+// (cell i,j has its centre at (i+0.5, j+0.5)); outside the grid reads 0, which
+// matches the Dirichlet border of the solve.
+function magBzAt(buf, x, y) {
+	const fx = x - 0.5, fy = y - 0.5;
+	const x0 = Math.floor(fx), y0 = Math.floor(fy);
+	const tx = fx - x0, ty = fy - y0;
+	const s = (i, j) => (i < 0 || j < 0 || i >= GRID_W || j >= GRID_H) ? 0 : buf[j * GRID_W + i];
+	return (1 - tx) * (1 - ty) * s(x0, y0) + tx * (1 - ty) * s(x0 + 1, y0)
+		+ (1 - tx) * ty * s(x0, y0 + 1) + tx * ty * s(x0 + 1, y0 + 1);
+}
+function magGradAt(buf, x, y) {
+	return {
+		gx: magBzAt(buf, x + 0.5, y) - magBzAt(buf, x - 0.5, y),
+		gy: magBzAt(buf, x, y + 0.5) - magBzAt(buf, x, y - 0.5)
+	};
+}
+
+// Diffusion magnetic engine: relax the persistent field, then read forces,
+// generated power and the energy projection off it.
+function magSolveDiffusion(mags, sweeps) {
+	const N = GRID_W * GRID_H;
+	if (!fieldBz || fieldBz.length !== N) fieldBz = new Float64Array(N);
+	if (!magBzCoil || magBzCoil.length !== N) magBzCoil = new Float64Array(N);
+	if (!magBzDip || magBzDip.length !== N) magBzDip = new Float64Array(N);
+
+	// 1) Coil field from the wire currents.
+	magBuildCoilSource();
+	if (!magSrcCells) magBzCoil.fill(0);   // no currents ⇒ steady state is exactly 0
+	else magRelax(magBzCoil, sweeps);
+
+	// 2) Dipole field of the self-emitting magnets (optional).
+	let emitting = false;
+	for (let i = 0; i < mags.length; i++) if (magEmits(mags[i])) { emitting = true; break; }
+	if (emitting) {
+		magBuildDipSource(mags);
+		if (!magSrcCells) magBzDip.fill(0);
+		else magRelax(magBzDip, sweeps);
+	} else if (magBzDip[0] !== 0 || magDipDirty(magBzDip)) magBzDip.fill(0);
+
+	// 3) Publish the sum as the shared Bz overlay (the B-field view reads this
+	//    buffer; no O(cells × edges) fill any more).
+	for (let i = 0; i < N; i++) fieldBz[i] = magBzCoil[i] + magBzDip[i];
+
+	// 4) Readouts.
+	//
+	// WHY THE FORCE IS NOT READ OFF THE RELAXED GRID (measured, not assumed):
+	// the relaxation reproduces the analytic Bz to ~0.5 % in value, but the
+	// force needs ∂Bz/∂a, and in the near-symmetric rail geometries the scenes
+	// actually use (a magnet centred between two opposite rails) the net
+	// gradient is a small residue of large cancelling terms. At one cell scale
+	// the truncation error swamps it — for the test_solenoid Test-20 loop:
+	//     exact ∂Bz/∂y = −1.413e−2   point stencil −6.03e−3   bilinear +3.18e−2
+	// i.e. the wrong magnitude and even the wrong sign. So the grid field owns
+	// the *state* (overlay, Bz telemetry, dipole emission, smooth range) while
+	// the force/EMF stay on the analytic coupling, which is exact, cheaper, and
+	// keeps Σ E·I + Σ F·v = 0 algebraically. The dipole force is analytic for
+	// the same reason, and so a body never feels its own emission.
+	for (let mi = 0; mi < mags.length; mi++) {
+		const mag = mags[mi];
+		const m = mag.magStrength != null ? mag.magStrength : 1;
+		const v = mag.vel || 0;
+		const c = bodyCenter(mag);
+		const hat = bodyHat(mag);
+		let sumBI = 0, maxI = 0, dipFx = 0, dipFy = 0;
+		const cp = mag._couple;
+		if (cp) for (let i = 0; i < cp.length; i++) {
+			const e = cp[i].e;
+			sumBI += cp[i].b * e.I;
+			if (Math.abs(e.I) > Math.abs(maxI)) maxI = e.I;
+		}
+		const Fcoil = m * K_B * sumBI;
+		for (let j = 0; j < mags.length; j++) {
+			if (j === mi || !magEmits(mags[j])) continue;
+			const mj = mags[j].magStrength != null ? mags[j].magStrength : 1;
+			const cj = bodyCenter(mags[j]);
+			const g = magDipGrad(c.x - cj.x, c.y - cj.y, mj);
+			dipFx += g.gx; dipFy += g.gy;
+		}
+		const Fdip = m * (dipFx * hat.ax + dipFy * hat.ay);
+		const elecP = -v * Fcoil;            // ≡ Σ_e E_e·I_e for this magnet
+		const self = mag._selfEdge;
+		mag.lastBz = magBzAt(magBzCoil, c.x, c.y) + magBzAt(magBzDip, c.x, c.y);
+		mag.lastFcoil = Fcoil + Fdip;
+		mag.lastPower = elecP;
+		mag.lastCurrent = isCaseA(mag) ? (self ? self.I : 0) : maxI;
+		mag.lastEMF = mag.lastCurrent ? elecP / mag.lastCurrent : 0;
+		const eta = mag.efficiency != null ? mag.efficiency : 0.85;
+		mag.lastHeat = Math.abs(elecP) * Math.max(0, 1 - eta);
+	}
+}
+function magDipDirty(buf) {
+	for (let i = 0; i < buf.length; i++) if (buf[i] !== 0) return true;
+	return false;
+}
+
+// LEGACY magnetic engine — the pre-diffusion per-frame Biot–Savart summation,
+// kept verbatim for regression. Zeroes and recomputes `fieldBz`, sums every
+// edge for every magnet, hard-cuts at MAG_RMAX. See magApplyEmfDirect for the
+// matching EMF half.
+function magSolveDirect(mags, Ngrid) {
+	if (!fieldBz || fieldBz.length !== Ngrid) fieldBz = new Float64Array(Ngrid);
+	else fieldBz.fill(0);
+	const sig2 = SIGMA_B * SIGMA_B;
+	const r2max = MAG_RMAX * MAG_RMAX;
+	for (let mi = 0; mi < mags.length; mi++) {
+		const mag = mags[mi];
+		const m = mag.magStrength != null ? mag.magStrength : 1;
+		const c = bodyCenter(mag);
+		const hat = bodyHat(mag);
+		let Bz = 0, dBx = 0, dBy = 0, elecP = 0, maxI = 0, bridgeI = 0;
+		for (let ei = 0; ei < fieldEdges.length; ei++) {
+			const e = fieldEdges[ei];
+			// edgeIsSelf() only excludes the armature BRIDGE edge (the conductor
+			// cell the body physically spans). Edges merely ADJACENT to the body
+			// cells are intentionally kept: a magnet legitimately feels the field
+			// of nearby current, including its own driving coil — this is by
+			// design (Case-A motor force comes from the rails, not the bridge),
+			// and is NOT a self-force bug to be "fixed" without a physics reason.
+			if (edgeIsSelf(e, mag)) {
+				bridgeI = e.I;
+				continue;
+			}
+			const rx = c.x - e.mx, ry = c.y - e.my;
+			if (rx * rx + ry * ry > r2max) continue;
+			const g = magKernelG(e.dlx, e.dly, rx, ry, sig2);
+			const gr = magKernelGrad(e.dlx, e.dly, rx, ry, sig2);
+			Bz += K_B * e.I * g;
+			dBx += K_B * e.I * gr.gx;
+			dBy += K_B * e.I * gr.gy;
+			// E_e,b for this magnet (same kernel as force)
+			const dgda = gr.gx * hat.ax + gr.gy * hat.ay;
+			const Eb = -m * K_B * dgda * (mag.vel || 0);
+			elecP += Eb * e.I;
+			if (Math.abs(e.I) > Math.abs(maxI)) maxI = e.I;
+		}
+		const F = m * (dBx * hat.ax + dBy * hat.ay);
+		mag.lastBz = Bz;
+		mag.lastFcoil = F;
+		mag.lastPower = elecP;
+		mag.lastCurrent = isCaseA(mag) ? bridgeI : maxI;
+		mag.lastEMF = mag.lastCurrent ? elecP / mag.lastCurrent : 0;
+		const eta = mag.efficiency != null ? mag.efficiency : 0.85;
+		mag.lastHeat = Math.abs(elecP) * Math.max(0, 1 - eta);
+	}
+	// Bz overlay is only needed in the B-field view; skip the O(N·E) fill in
+	// other views. Switching to B-field triggers a recompute (sim loop guard or
+	// the setColorView one-shot).
+	if (colorView === 'bfield') {
+		for (let i = 0; i < Ngrid; i++) {
+			const cx = (i % GRID_W) + 0.5, cy = ((i / GRID_W) | 0) + 0.5;
+			let Bz = 0;
+			for (let ei = 0; ei < fieldEdges.length; ei++) {
+				const e = fieldEdges[ei];
+				const rx = cx - e.mx, ry = cy - e.my;
+				if (rx * rx + ry * ry > r2max) continue;
+				Bz += K_B * e.I * magKernelG(e.dlx, e.dly, rx, ry, sig2);
+			}
+			fieldBz[i] = Bz;
+		}
+	}
+}
+
+// Drop every piece of magnetic solver state (engine switch / board reset).
+function magReset() {
+	if (magBzCoil) magBzCoil.fill(0);
+	if (magBzDip) magBzDip.fill(0);
+	if (magSrc) magSrc.fill(0);
+	if (fieldBz) fieldBz.fill(0);
+	magSrcCells = 0; magLastDv = 0;
+}
+
 function fieldSimulate() {
 	// 1) Per-cell resistance grid + connected components.
 	fieldLampByIdx = new Map(lamps.map(l => [l.idx, l]));
@@ -465,8 +970,6 @@ function fieldSimulate() {
 	//    diffusion over animation frames. The forbidden set keeps the generic
 	//    4-neighbour coupling from also shorting the battery's poles.
 	const gOf = (u, v) => 1 / (R[u] + R[v]);
-	const sig2 = SIGMA_B * SIGMA_B;
-	const r2max = MAG_RMAX * MAG_RMAX;
 	const mags = magnetList();
 
 	// Per-edge registry (a < b, row-major) + magnet-induced EMF.
@@ -485,22 +988,21 @@ function fieldSimulate() {
 			const dlx = dx, dly = dy;
 			const mx = (cx + nx) * 0.5 + 0.5;
 			const my = (cy + ny) * 0.5 + 0.5;
-			let E = 0;
-			for (let mi = 0; mi < mags.length; mi++) {
-				const mag = mags[mi];
-				const edgeTmp = { a, b };
-				if (edgeIsSelf(edgeTmp, mag)) continue;
-				const c = bodyCenter(mag);
-				const rx = c.x - mx, ry = c.y - my;
-				if (rx * rx + ry * ry > r2max) continue;
-				const hat = bodyHat(mag);
-				const gxy = magKernelGrad(dlx, dly, rx, ry, sig2);
-				const dgda = gxy.gx * hat.ax + gxy.gy * hat.ay;
-				E += -(mag.magStrength || 1) * K_B * dgda * (mag.vel || 0);
-			}
-			const edge = { a, b, Re, dlx, dly, mx, my, E, I: 0, key: a + ':' + b };
+			const edge = { a, b, Re, dlx, dly, mx, my, E: 0, I: 0, key: a + ':' + b };
 			fieldEdges.push(edge);
 			fieldEdgeMap.set(edge.key, edge);
+		}
+	}
+
+	// Magnet-induced (motional) EMF on the edge registry. Both engines fill
+	// the same `e.E`; they differ in the coupling kernel's range and in the
+	// power projection (see magApplyEmfDiffusion).
+	if (mags.length) {
+		if (magEngine === 'direct') magApplyEmfDirect(mags);
+		else {
+			magBuildEdgeCells();
+			magBuildCoupling(mags);
+			magApplyEmfDiffusion(mags);
 		}
 	}
 
@@ -735,12 +1237,10 @@ function fieldPublish() {
 		if (!hasLoad && nBatt > 0) for (const n of s.comp) shorts.add(n);
 	}
 
-	// Per-edge current, Bz overlay, magnet force / EMF readouts, energy identity.
+	// Per-edge current, then the magnetic solve, then the energy identity.
+	// Both magnetic engines read the same `e.I`; 'diffusion' advances the
+	// persistent Bz field, 'direct' re-sums Biot–Savart from scratch.
 	const Ngrid = GRID_W * GRID_H;
-	if (!fieldBz || fieldBz.length !== Ngrid) fieldBz = new Float64Array(Ngrid);
-	else fieldBz.fill(0);
-	const sig2 = SIGMA_B * SIGMA_B;
-	const r2max = MAG_RMAX * MAG_RMAX;
 	const live = new Set();
 	for (const s of fieldSystems) for (let i = 0; i < s.comp.length; i++) live.add(s.comp[i]);
 	for (let ei = 0; ei < fieldEdges.length; ei++) {
@@ -750,61 +1250,12 @@ function fieldPublish() {
 		e.I = (Va - Vb + (e.E || 0)) / e.Re;
 	}
 	const mags = magnetList();
-	for (let mi = 0; mi < mags.length; mi++) {
-		const mag = mags[mi];
-		const m = mag.magStrength != null ? mag.magStrength : 1;
-		const c = bodyCenter(mag);
-		const hat = bodyHat(mag);
-		let Bz = 0, dBx = 0, dBy = 0, elecP = 0, maxI = 0, bridgeI = 0;
-		for (let ei = 0; ei < fieldEdges.length; ei++) {
-			const e = fieldEdges[ei];
-			// edgeIsSelf() only excludes the armature BRIDGE edge (the conductor
-			// cell the body physically spans). Edges merely ADJACENT to the body
-			// cells are intentionally kept: a magnet legitimately feels the field
-			// of nearby current, including its own driving coil — this is by
-			// design (Case-A motor force comes from the rails, not the bridge),
-			// and is NOT a self-force bug to be "fixed" without a physics reason.
-			if (edgeIsSelf(e, mag)) {
-				bridgeI = e.I;
-				continue;
-			}
-			const rx = c.x - e.mx, ry = c.y - e.my;
-			if (rx * rx + ry * ry > r2max) continue;
-			const g = magKernelG(e.dlx, e.dly, rx, ry, sig2);
-			const gr = magKernelGrad(e.dlx, e.dly, rx, ry, sig2);
-			Bz += K_B * e.I * g;
-			dBx += K_B * e.I * gr.gx;
-			dBy += K_B * e.I * gr.gy;
-			// E_e,b for this magnet (same kernel as force)
-			const dgda = gr.gx * hat.ax + gr.gy * hat.ay;
-			const Eb = -m * K_B * dgda * (mag.vel || 0);
-			elecP += Eb * e.I;
-			if (Math.abs(e.I) > Math.abs(maxI)) maxI = e.I;
-		}
-		const F = m * (dBx * hat.ax + dBy * hat.ay);
-		mag.lastBz = Bz;
-		mag.lastFcoil = F;
-		mag.lastPower = elecP;
-		mag.lastCurrent = isCaseA(mag) ? bridgeI : maxI;
-		mag.lastEMF = mag.lastCurrent ? elecP / mag.lastCurrent : 0;
-		const eta = mag.efficiency != null ? mag.efficiency : 0.85;
-		mag.lastHeat = Math.abs(elecP) * Math.max(0, 1 - eta);
-	}
- 	// Bz overlay is only needed in the B-field view; skip the O(N·E) fill in
-	// other views. Switching to B-field triggers a recompute (sim loop guard or
-	// the setColorView one-shot).
-	if (colorView === 'bfield') {
-		for (let i = 0; i < Ngrid; i++) {
-			const cx = (i % GRID_W) + 0.5, cy = ((i / GRID_W) | 0) + 0.5;
-			let Bz = 0;
-			for (let ei = 0; ei < fieldEdges.length; ei++) {
-				const e = fieldEdges[ei];
-				const rx = cx - e.mx, ry = cy - e.my;
-				if (rx * rx + ry * ry > r2max) continue;
-				Bz += K_B * e.I * magKernelG(e.dlx, e.dly, rx, ry, sig2);
-			}
-			fieldBz[i] = Bz;
-		}
+	if (magEngine === 'direct') {
+		magSolveDirect(mags, Ngrid);
+	} else if (mags.length || colorView === 'bfield') {
+		// The diffused field only needs advancing when something can read it:
+		// a magnet (force / EMF / telemetry) or the B-field view.
+		magSolveDiffusion(mags, MAG_SWEEPS_PER_FRAME);
 	}
 	let residual = 0;
 	for (let ei = 0; ei < fieldEdges.length; ei++) residual += fieldEdges[ei].E * fieldEdges[ei].I;
@@ -910,9 +1361,11 @@ function simTick(now) {
 	lastSimT = now;
 	const dt = (realDt * TIME_SCALE) / HEAT_SWEEPS_PER_FRAME;  // s per air sub-step
 	if (electricActive()) {
-		if (magnetList().length || colorView === 'bfield') fieldSimulate(); // rebuild edges/EMF/Case-A cells + Bz overlay
+		if (magnetList().length || colorView === 'bfield') fieldSimulate(); // rebuild edges/EMF/Case-A cells + magnetic coupling
 		fieldRelax(FIELD_SWEEPS_PER_FRAME);
-		fieldPublish();   // also refreshes heatSource every frame
+		// fieldPublish also advances the magnetic diffusion (magSolveDiffusion)
+		// and refreshes heatSource every frame.
+		fieldPublish();
 	} else if (heatAirActive()) {
 		// With the electric engine gated off, fieldPublish never runs, so its
 		// heatSource (lamp heat) would go stale. Recompute it here — it is

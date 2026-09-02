@@ -159,7 +159,27 @@ let pistonIdSeq = 0;
 const bodies = pistons; // alias; pistons remains the array of record
 let K_B = 40;           // magnetic kernel gain (slider)
 const SIGMA_B = 0.5;    // soft-core radius (cells)
-const MAG_RMAX = 8;     // kernel cutoff (cells)
+const MAG_RMAX = 8;     // kernel cutoff (cells) — LEGACY ('direct') engine only
+
+// Magnetic engine selection. Mirrors the electric `activeEngine` split:
+//  'diffusion' (default) — Bz is persistent solver state, relaxed by
+//    red-black Gauss–Seidel every frame from a local source: the discrete
+//    Laplacian of the MAG_RANGE-windowed Biot–Savart field, so the relaxed
+//    field IS that analytic field, smoothly tapered instead of hard-cut.
+//    Warm-started, O(cells) per sweep, no cutoff discontinuity.
+//  'direct' — OBSOLETE legacy path: per-frame Biot–Savart summation over
+//    every current edge for every magnet, with a hard MAG_RMAX cutoff. Kept
+//    selectable for regression/comparison; no new features planned.
+let magEngine = 'diffusion';
+// Field radius (cells) of the diffused engine: the kernel is tapered smoothly
+// to zero here instead of being hard-cut (the legacy MAG_RMAX jump). Measured
+// on the solenoid scenes: the net force is a small residue of large cancelling
+// near-field terms, so it flips sign below ~7 cells — hence the default keeps
+// the legacy 8-cell radius and lets the taper do the shortening (w(6) ≈ 0.19).
+let MAG_RANGE = 8;
+const MAG_SWEEPS_PER_FRAME = 50;      // B relaxation steps advanced each frame
+let magEmitAll = false;               // master switch: every magnet emits its dipole field
+const MAG_EMIT_R = 3;                 // dipole source window (cells) around a body
 
 function bodyMoveAxis(b) { return b.moveAxis || b.axis; }
 function isCaseA(b) { return !!b.magnet && b.axis && bodyMoveAxis(b) !== b.axis; }
@@ -214,6 +234,11 @@ function createMechanicalBody(spec) {
 		limited: spec.limited != null ? spec.limited : true,
 		magnet: !!spec.magnet,
 		magStrength: spec.magStrength != null ? spec.magStrength : 1,
+		// `emit` makes the body a source of its own dipole field (magnet↔magnet
+		// coupling + a visible dipole in the B-field view). Only meaningful for
+		// magnets, and only the diffusion engine injects it. `magEmitAll` is a
+		// GUI master switch that forces every magnet to emit.
+		emit: !!spec.emit,
 		R_arm: spec.R_arm != null ? spec.R_arm : 2,
 		efficiency: spec.efficiency != null ? spec.efficiency : 0.85,
 		lastFpress: 0, lastFfric: 0, lastFcoil: 0,
@@ -470,8 +495,9 @@ function updateStatus(x, y) {
 		}
 	}
   const engineName = activeEngine === 'field' ? 'Field' : 'Circuit (obsolete)';
+  const magName = magEngine === 'direct' ? 'Direct (obsolete)' : 'Diffusion';
   const viewName = colorView === 'net' ? 'Net' : colorView === 'electric' ? 'Electric' : colorView === 'voltage' ? 'Voltage' : colorView === 'heat' ? 'Heat' : colorView === 'pressure' ? 'Pressure' : colorView === 'bfield' ? 'B-field' : 'Light';
-  statusBar.textContent = `Tool: ${tn}   |   Cell: ${ci}   |   Type: ${ti}${extra}   |   Net: ${selectedColor}   |   View: ${viewName}   |   Engine: ${engineName}   |   T: ${tStr}   |   P: ${pStr}`;
+  statusBar.textContent = `Tool: ${tn}   |   Cell: ${ci}   |   Type: ${ti}${extra}   |   Net: ${selectedColor}   |   View: ${viewName}   |   Engine: ${engineName}   |   Mag: ${magName}   |   T: ${tStr}   |   P: ${pStr}`;
 }
 
 const dirs = [{dx:0,dy:-1}, {dx:1,dy:0}, {dx:0,dy:1}, {dx:-1,dy:0}];

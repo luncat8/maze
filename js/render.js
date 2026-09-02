@@ -310,7 +310,7 @@ const INPUT_FNS = {
 	airsink: { rate: s => s.rate },
 	pipevalve:  { open: v => v.open },
 	pipeportal: { open: p => p.open },
-	piston:     { friction: p => p.friction != null ? p.friction : 50, magStrength: p => p.magStrength != null ? p.magStrength : 1, R_arm: p => p.R_arm != null ? p.R_arm : 2, efficiency: p => Math.round((p.efficiency != null ? p.efficiency : 0.85) * 100), magnet: p => !!p.magnet },
+	piston:     { friction: p => p.friction != null ? p.friction : 50, magStrength: p => p.magStrength != null ? p.magStrength : 1, R_arm: p => p.R_arm != null ? p.R_arm : 2, efficiency: p => Math.round((p.efficiency != null ? p.efficiency : 0.85) * 100), magnet: p => !!p.magnet, emit: p => !!p.emit },
 	pump:       { dir: p => p.dir || 0, R: p => p.R != null ? p.R : 10, efficiency: p => Math.round((p.efficiency != null ? p.efficiency : 0.7) * 100) },
 };
 function computeInput(kind, field, ref) {
@@ -351,6 +351,7 @@ function makeInputHandler(kind, field, ref, root) {
 		else if (field === 'magStrength') ref.magStrength = v;
 		else if (field === 'R_arm') ref.R_arm = v;
 		else if (field === 'magnet') { ref.magnet = !!v; startSimLoop(); recompute(); return; }
+		else if (field === 'emit') { ref.emit = !!v; startSimLoop(); recompute(); return; }
 		const head = HEAD_BIND[field];
 		if (head && root._refs && root._refs.bind[head]) {
 			const t = computeBind(kind, head, ref);
