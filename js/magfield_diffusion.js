@@ -28,8 +28,15 @@
 let magSrcHy3 = null;        // Float64Array(N): current-frame source (curl J + dipole)
 let magSrcSelfHy3 = null;    // scratch: one magnet's own dipole source
 let magBzSelfHy3 = null;     // scratch: relaxed self-field for a single magnet
-
 const MAG_SWEEPS = 40;       // self-field convergence sweeps per magnet
+
+// Phase 1 calibration gain. The Stokes-formulated curl source on the unit
+// grid is much smaller than Ar's windowed analytic sum, so the relaxed
+// field (and the magnet force) come out ~20× weaker at the same K_B.
+// Multiply the source by this factor so the field is in the same ballpark
+// as Ar (Phase 2 will replace the source formulation with a MAC-staggered
+// centered curl + per-edge coupling, and this gain can go back to 1).
+const MAG_SRC_GAIN_HY3 = 20;
 
 // Wipe the warm-started field so stale cross-engine/cross-λ state can't bleed
 // in. Called on engine switch, λ change, or dipole toggle.
@@ -114,8 +121,10 @@ function magDiffusionBuildSource() {
 		injectDipoleSource(mag, magSrcHy3, 1);
 	}
 
-	// Scale the curl source by K_B (carries over the legacy gain).
-	for (let i = 0; i < N; i++) magSrcHy3[i] *= K_B;
+	// Scale the curl source by K_B × MAG_SRC_GAIN_HY3 (the gain compensates for
+	// the small Stokes-formulation normalization so the field is in the same
+	// ballpark as Ar's windowed analytic sum; see MAG_SRC_GAIN_HY3 above).
+	for (let i = 0; i < N; i++) magSrcHy3[i] *= K_B * MAG_SRC_GAIN_HY3;
 }
 
 // Add magnet `mag`'s two opposite dipole point sources (scaled by `scale`) to
@@ -179,7 +188,7 @@ function magDiffusionPublish(mags) {
 			// converge (a point source spreads slowly), matching the converged
 			// warm-started fieldBz it is subtracted from.
 			magSrcSelfHy3.fill(0);
-			injectDipoleSource(mag, magSrcSelfHy3, K_B); // pre-scale like magSrcHy3
+			injectDipoleSource(mag, magSrcSelfHy3, K_B * MAG_SRC_GAIN_HY3); // pre-scale like magSrcHy3
 			magBzSelfHy3.fill(0);
 			magRelaxInto(magSrcSelfHy3, magBzSelfHy3, MAG_SWEEPS * 6);
 			const sbz = (cx, cy) => (cx < 0 || cx >= W || cy < 0 || cy >= H) ? 0 : magBzSelfHy3[cy * W + cx];
