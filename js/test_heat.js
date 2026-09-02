@@ -10,8 +10,8 @@ const TIME_SCALE = 10;        // sim runs 10x real time
 const SUBSTEPS = 8;
 
 // ---- tunable model constants (to be baked into state.js) ----
-let G_COND = +(process.argv[2] || 300);    // W/K effective per face (conduction)
-let G_SINK = +(process.argv[3] || 300);    // W/K removed by a placed Heat Sink
+let G_COND = +(process.argv[2] || 200);    // W/K effective per face (conduction) — mirrors state.js G_COND
+let G_SINK = +(process.argv[3] || 400);    // W/K removed by a placed Heat Sink — mirrors state.js G_SINK
 let P_SRC  = +(process.argv[4] || 3000);   // effective W injected by the source cell (test)
 const T_AMB = 293;
 

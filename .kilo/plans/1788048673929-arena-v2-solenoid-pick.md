@@ -1,5 +1,30 @@
 # Plan: arena-v2 fixes + pick features from solenoid-v2
 
+Status: IMPLEMENTED on `arena/01a06118-maze`. All six suites pass
+(`test_solenoid` 72/72, `test_piston_pump` 35/35, `test_electric_demo` 17/17,
+`test_air`, `test_heat`, `test_scene_copy` 21/21).
+
+Review results vs the plan:
+
+- Tasks 1–3 (B-field live in idle+view, button handlers, two new scenes) are in
+  place (`js/electric.js`, `js/ui.js`, `js/render.js`, `index.html`).
+- Task 4 tests are ported and strengthened. **Test 4 was strengthened again in
+  review:** the old 2-rail rig left the battery connected to only one rail, so
+  all edge currents were zero and the assertion only checked `Number.isFinite`.
+  It now uses a closed rectangular loop (`loopWire` + `placeBattery`) and asserts
+  `|Bmid| > 1e-3` and `|Fend| > 1e-4` (actual `Bmid≈40.2`, `Fend≈0.73 N`).
+- `test_heat` was re-baselined to the live constants (`G_COND=200`, `G_SINK=400`
+  from `state.js`), so the standalone heat mirror passes again.
+- Duplicated `index.html` tail is gone (file ends at one `</html>`), the
+  contact-edge self-force decision is commented in `js/electric.js`, and the
+  translate acceptance criterion is documented (not asserted) in
+  `js/test_solenoid.js`.
+- Optional `fieldCellEdges` spatial hash: intentionally left on the current
+  brute-force `fieldEdges` path. It is the only higher-risk refactor in the
+  plan and at this grid size (≤~1k cells, tens of edges) it buys little; the
+  plan explicitly allows keeping this path if the hash risks destabilizing the
+  field kernel.
+
 Branch: `arena-v2` @ `08268db`. Source branch: `solenoid-v2` @ `de67e9d`.
 Run headless tests with `node js/<file>.js` (they use a VM + DOM stub).
 

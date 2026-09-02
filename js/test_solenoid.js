@@ -252,19 +252,22 @@ runCode(`globalThis.__w0 = { B: pistons[0].lastBz, F: pistons[0].lastFcoil };`);
 assert(Math.abs(sandbox.__w0.B) < 1e-8 && Math.abs(sandbox.__w0.F) < 1e-8, 'no current → Bz=0, F=0');
 
 // ---- 4. two rails / solenoid gradient ----
+// A closed rectangular loop (wire ring) with the battery on the top-left
+// corner is the canonical "opposite-current rails" rig: the top and bottom
+// long sides carry opposite currents, so the field between them is strong,
+// and the magnet at the end feels a gradient pulling it toward the middle.
 console.log('\n== Test 4: opposite-current rails ==');
 clearBoard();
 runCode(`
-	for (let x = 5; x <= 18; x++) {
-		grid[9 * GRID_W + x] = 0; grid[11 * GRID_W + x] = 0; grid[10 * GRID_W + x] = 0;
-		metalCells[9 * GRID_W + x] = 1; metalCells[11 * GRID_W + x] = 1;
-	}
-	for (let y = 9; y <= 11; y++) { grid[y * GRID_W + 5] = 0; metalCells[y * GRID_W + 5] = 1; }
-	grid[8 * GRID_W + 5] = 0; grid[9 * GRID_W + 5] = 0;
+	for (let y = 9; y <= 11; y++)
+		for (let x = 6; x <= 18; x++) grid[y * GRID_W + x] = 0;
 	seedAir();
-	placeBattery(5, 8);
+`);
+loopWire(6, 9, 18, 11);
+runCode(`
+	placeBattery(6, 9);
 	pistons.push(createMechanicalBody({
-		x: 8, y: 10, axis: 'h', moveAxis: 'h', magnet: true, pos: 8, friction: 0
+		x: 12, y: 10, axis: 'h', moveAxis: 'h', magnet: true, pos: 12, friction: 0, magStrength: 1
 	}));
 	fieldSimulate();
 `);
@@ -272,7 +275,7 @@ settle(80);
 runCode(`
 	var mag = pistons[0];
 	globalThis.__Bmid = mag.lastBz;
-	mag.pos = 16; mag.x = 16;
+	mag.pos = 8; mag.x = 8;
 	fieldSimulate();
 `);
 settle(40);
@@ -280,9 +283,11 @@ runCode(`
 	globalThis.__rails = { Bmid: globalThis.__Bmid, Bend: pistons[0].lastBz, Fend: pistons[0].lastFcoil };
 `);
 const rails = sandbox.__rails;
-assert(Number.isFinite(rails.Bmid), `Bz between rails is finite (${rails.Bmid.toFixed(4)})`);
-assert(Number.isFinite(rails.Fend), `force is well-defined (no NaN) for the magnet beside the energized rails (F=${rails.Fend.toFixed(4)} N)`);
-assert(Number.isFinite(rails.Bmid), `Bz is finite between the opposite-current rails (B=${rails.Bmid.toFixed(4)})`);
+assert(Number.isFinite(rails.Bmid) && Math.abs(rails.Bmid) > 1e-3,
+	`Bz between the opposite-current rails is finite and non-zero (Bmid=${rails.Bmid.toFixed(4)})`);
+assert(Number.isFinite(rails.Fend) && Math.abs(rails.Fend) > 1e-4,
+	`magnet at the rail end feels a non-zero gradient force (Fend=${rails.Fend.toFixed(4)} N)`);
+assert(Number.isFinite(rails.Bend), `Bz at the rail end is finite (Bend=${rails.Bend.toFixed(4)})`);
 
 // ---- 5. arbitrary geometry: L-shaped run matches analytic kernel ----
 console.log('\n== Test 5: arbitrary geometry (no pattern matching) ==');
