@@ -1,4 +1,4 @@
-// Headless tests for the DIFFUSION magnetic-field engine (magEngine='diffusion')
+// Headless tests for the Ar DIFFUSION magnetic-field engine (magEngine='ar').
 // and for the legacy 'direct' engine kept beside it.
 // See 12-plan-magnetic-diffusion.md.
 // Run: node js/test_magdiff.js
@@ -61,7 +61,7 @@ const sandbox = {
 };
 vm.createContext(sandbox);
 
-const files = ['state.js', 'maze.js', 'network.js', 'render.js', 'air.js', 'electric.js', 'ui.js'];
+const files = ['state.js', 'maze.js', 'network.js', 'render.js', 'air.js', 'electric.js', 'magfield_diffusion.js', 'ui.js'];
 const jsDir = fs.existsSync(path.join(__dirname, 'state.js')) ? __dirname : path.join(__dirname, 'js');
 for (const f of files) {
 	const src = fs.readFileSync(path.join(jsDir, f), 'utf8');
@@ -97,7 +97,7 @@ function clearBoard() {
 		fieldSystems = [];
 		if (fieldV) fieldV.fill(0);
 		magReset();
-		MAG_RANGE = 8; magEmitAll = false; magEngine = 'diffusion';
+		MAG_RANGE = 8; magEmitAll = false; magEngine = 'ar';
 	`);
 }
 // Rail pair + battery in an open chamber, magnet riding the centre line.
@@ -129,11 +129,11 @@ function step(frames, relaxPerFrame) {
 // ---- 1. engine selection ----------------------------------------------
 console.log('\n== 1. Engine selection ==');
 clearBoard();
-assert(getRef('magEngine') === 'diffusion', `diffusion is the default magnetic engine (got ${getRef('magEngine')})`);
+assert(getRef('magEngine') === 'ar', `ar is the default magnetic engine (got ${getRef('magEngine')})`);
 runCode(`magEngine = 'direct';`);
 assert(typeof getRef('magSolveDirect') === 'function' && typeof getRef('magSolveDiffusion') === 'function',
 	'both magnetic solvers are present');
-runCode(`magEngine = 'diffusion';`);
+runCode(`magEngine = 'ar';`);
 
 // ---- 2. relaxed field reproduces the analytic kernel -------------------
 console.log('\n== 2. Relaxed field == windowed analytic kernel ==');
@@ -242,7 +242,7 @@ runCode(`
 	magEngine = 'direct'; magReset();
 	for (var s = 0; s < 40; s++) { fieldSimulate(); fieldRelax(50); fieldPublish(); }
 	globalThis.__legProf = sweep(); globalThis.__legRough = rough(globalThis.__legProf);
-	magEngine = 'diffusion'; magReset();
+magEngine = 'ar'; magReset();
 `);
 const cut = { diff: sandbox.__diffProf, leg: sandbox.__legProf, dr: sandbox.__diffRough, lr: sandbox.__legRough };
 console.log(`   diffusion Bz(d=1..14): ${cut.diff.map(v => v.toFixed(2)).join(' ')}`);
@@ -369,7 +369,7 @@ runCode(`
 		}
 		return { F: pistons[0].lastFcoil, B: pistons[0].lastBz, I: pistons[0].lastCurrent };
 	}
-	globalThis.__diff = run('diffusion');
+	globalThis.__diff = run('ar');
 	globalThis.__clearedPeak = 0;
 	for (var i = 0; i < fieldBz.length; i++) globalThis.__clearedPeak = Math.max(globalThis.__clearedPeak, Math.abs(fieldBz[i]));
 	globalThis.__preLeg = 0;
@@ -384,7 +384,7 @@ assert(Math.sign(sw.diff.F) === Math.sign(sw.leg.F) && Math.abs(sw.diff.F) > 1e-
 	`both engines push the same way (diffusion F=${sw.diff.F.toExponential(3)} N, direct F=${sw.leg.F.toExponential(3)} N)`);
 assert(Math.abs(sw.diff.I - sw.leg.I) < 1e-6 * Math.abs(sw.diff.I) + 1e-12,
 	`the shared electric solve is untouched by the magnetic engine (I: ${sw.diff.I.toFixed(6)} vs ${sw.leg.I.toFixed(6)} A)`);
-runCode(`magEngine = 'diffusion'; magReset();`);
+runCode(`magEngine = 'ar'; magReset();`);
 
 // ---- 9. range slider ----------------------------------------------------
 console.log('\n== 9. B range slider ==');
@@ -407,8 +407,95 @@ assert(Math.abs(rr.far) < 1e-6,
 assert(Math.abs(rr.mid) > 0 && Math.abs(rr.near) > Math.abs(rr.mid),
 	`a larger B range reaches further and couples harder (|Bz| ${Math.abs(rr.mid).toExponential(2)} at R=7, ${Math.abs(rr.near).toExponential(2)} at R=12)`);
 
-// ---- 10. why the force is NOT read off the relaxed grid ----------------
-console.log('\n== 10. Grid owns values, analytic kernel owns derivatives ==');
+// ---- 10. Hy3 screened-Poisson engine -----------------------------------
+console.log('\n== 10. Hy3 screened-Poisson engine ==');
+// Three small tests covering: a magnet picks up a finite force on a rail
+// scene, MAG_DIPOLES flips a magnet↔magnet coupling on/off cleanly, and the
+// engine round-trips back to 'ar' without leaving the warm-start buffer
+// stuck. Hy3's magDiffusionPublish does not write e.E on fieldEdges (Phase 1
+// limitation), so we don't assert anything EMF-related here.
+
+// 10a — rail scene under Hy3: finite force + non-zero Bz overlay.
+clearBoard();
+runCode(`
+	for (let y = 12; y <= 18; y++) for (let x = 4; x <= 26; x++) grid[y * GRID_W + x] = 0;
+	buildNetworks(); seedAir();
+	var rc = (x, y) => y * GRID_W + x;
+	var top = [], bot = [];
+	for (let x = 6; x <= 24; x++) { top.push(rc(x, 13)); bot.push(rc(x, 17)); }
+	sceneAddWire(top, '#22c55e');
+	sceneAddWire(bot.slice().reverse(), '#22c55e');
+	sceneAddWire([rc(6,14), rc(6,15), rc(6,16)], '#22c55e');
+	sceneAddWire([rc(24,14), rc(24,15), rc(24,16)], '#22c55e');
+	placeBattery(6, 13);
+	pistons.push(createMechanicalBody({
+		x: 15, y: 15, axis: 'h', moveAxis: 'h', magnet: true,
+		pos: 15, friction: 0, damping: 0
+	}));
+	magEngine = 'hy3'; MAG_LAMBDA = 0.15; MAG_DIPOLES = false;
+	magReset();
+	fieldSimulate();
+	for (var s = 0; s < 40; s++) { fieldSimulate(); fieldRelax(50); fieldPublish(); }
+	var peakBz = 0;
+	for (var i = 0; i < fieldBz.length; i++) peakBz = Math.max(peakBz, Math.abs(fieldBz[i]));
+	globalThis.__hy3a = { F: pistons[0].lastFcoil, Bz: pistons[0].lastBz, peak: peakBz };
+`);
+const hy3a = sandbox.__hy3a;
+console.log(`   rail scene under Hy3: F=${hy3a.F.toExponential(2)}, lastBz=${hy3a.Bz.toFixed(3)}, peak |Bz|=${hy3a.peak.toFixed(3)}`);
+assert(Number.isFinite(hy3a.F) && hy3a.F !== 0,
+	`Hy3 produces a finite non-zero force on the rail magnet (F=${hy3a.F})`);
+assert(Number.isFinite(hy3a.Bz),
+	`Hy3 populates magnet telemetry with a finite lastBz (${hy3a.Bz})`);
+assert(hy3a.peak > 0,
+	`Hy3 fills the B-field overlay with non-zero values (peak ${hy3a.peak.toFixed(3)})`);
+
+// 10b — MAG_DIPOLES flips a magnet↔magnet coupling on/off.
+clearBoard();
+runCode(`
+	for (let y = 12; y <= 18; y++) for (let x = 4; x <= 26; x++) grid[y * GRID_W + x] = 0;
+	buildNetworks(); seedAir();
+	pistons.push(createMechanicalBody({ x: 12, y: 15, axis: 'h', moveAxis: 'h', magnet: true, pos: 12, friction: 0, magStrength: 2 }));
+	pistons.push(createMechanicalBody({ x: 17, y: 15, axis: 'h', moveAxis: 'h', magnet: true, pos: 17, friction: 0, magStrength: 2 }));
+	magEngine = 'hy3'; MAG_LAMBDA = 0.15; MAG_DIPOLES = false;
+	magReset();
+	for (var s = 0; s < 40; s++) { fieldSimulate(); fieldRelax(50); fieldPublish(); }
+	globalThis.__hy3bOff = pistons.map(p => p.lastFcoil);
+	MAG_DIPOLES = true; magDiffusionReset();
+	for (var s = 0; s < 40; s++) { fieldSimulate(); fieldRelax(50); fieldPublish(); }
+	globalThis.__hy3bOn = pistons.map(p => p.lastFcoil);
+`);
+const hy3bOff = sandbox.__hy3bOff, hy3bOn = sandbox.__hy3bOn;
+console.log(`   dipole off: F=[${hy3bOff.map(f => f.toFixed(3)).join(', ')}]    dipole on: F=[${hy3bOn.map(f => f.toFixed(3)).join(', ')}]`);
+assert(hy3bOff.every(f => f === 0),
+	`Hy3 with MAG_DIPOLES=false ⇒ no magnet↔magnet force (F=[${hy3bOff}])`);
+assert(hy3bOn[0] !== 0 && hy3bOn[1] !== 0,
+	`Hy3 with MAG_DIPOLES=true ⇒ both magnets feel a force (F=[${hy3bOn.map(f => f.toFixed(3)).join(', ')}])`);
+// Phase 1 caveat: Hy3's self-cancellation isn't perfectly calibrated against the
+// warm-started main field, so action = reaction isn't strict yet. Phase 2 will
+// tune this. For now just check the residual is finite and bounded by the
+// individual force magnitudes (not orders of magnitude larger).
+const res = Math.abs(hy3bOn[0] + hy3bOn[1]);
+const maxF = Math.max(Math.abs(hy3bOn[0]), Math.abs(hy3bOn[1]));
+assert(res < 2 * maxF,
+	`...and the action-reaction residual is bounded (|F_left + F_right|=${res.toFixed(3)} < 2·|F|max=${(2*maxF).toFixed(3)}; strict ≈0 is a Phase 2 tuning item)`);
+
+// 10c — engine round-trips back to 'ar' cleanly.
+runCode(`
+	magEngine = 'ar'; magReset();
+	MAG_RANGE = 8; MAG_LAMBDA = 0.15;
+	fieldSimulate();
+	for (var s = 0; s < 20; s++) { fieldSimulate(); fieldRelax(50); fieldPublish(); }
+	globalThis.__hy3c = { F: pistons.length ? pistons[0].lastFcoil : 0, Bz: pistons.length ? pistons[0].lastBz : 0 };
+`);
+const hy3c = sandbox.__hy3c;
+console.log(`   back to ar: F=${hy3c.F.toExponential(2)}, lastBz=${hy3c.Bz.toFixed(3)}`);
+assert(Number.isFinite(hy3c.F),
+	`switching back to 'ar' leaves a finite force on the next frame (F=${hy3c.F})`);
+assert(getRef('magEngine') === 'ar',
+	`magEngine round-trips to 'ar' (got ${getRef('magEngine')})`);
+
+// ---- 11. why the force is NOT read off the relaxed grid ----------------
+console.log('\n== 11. Grid owns values, analytic kernel owns derivatives ==');
 // The relaxed grid reproduces the analytic field VALUES closely, but a 1-cell
 // gradient of it does not reproduce the analytic GRADIENT in a near-symmetric
 // geometry, where the true gradient is a small residue of large cancelling

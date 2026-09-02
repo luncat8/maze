@@ -193,18 +193,22 @@
 					<option value="circuit">Circuit (nodal, obsolete)</option>
 				</select>
 			</label>
-			<label class="ctrl" title="Diffusion relaxes a persistent Bz field (Poisson, ∇²B=S from a windowed Biot–Savart source) a few sweeps per frame: smooth, warm-started, cheap. Direct is the legacy per-frame Biot–Savart sum with a hard 8-cell cutoff — kept for comparison, no new features.">Magnetics:
+			<label class="ctrl" title="Ar: Bz diffusion from a windowed Biot–Savart source (default, warm-started, smooth). Hy3: screened-Poisson (∇²−λ²)Bz=S — separate lambda-tunable decay; ships without back-EMF in Phase 1. Direct: legacy per-frame Biot–Savart sum with hard MAG_RMAX cutoff (obsolete, regression only).">Magnetics:
 				<select id="magEngineSel">
-					<option value="diffusion">B diffusion</option>
-					<option value="direct">B direct sum (obsolete)</option>
+					<option value="ar" selected>Diffusion-Ar (analytic)</option>
+					<option value="hy3">Diffusion-Hy3 (screened)</option>
+					<option value="direct">Direct (obsolete)</option>
 				</select>
 			</label>
-			<label class="ctrl" title="Radius of the diffused magnetic field, in cells: the kernel tapers smoothly to zero here (no hard cutoff jump). Larger = longer reach (16 ≈ whole grid); smaller = tighter, more 2D-looking coupling but weaker net force on centred magnets.">B range:
+			<label class="ctrl" id="magRangeLbl" title="Radius of the Ar diffused magnetic field, in cells: the kernel tapers smoothly to zero here (no hard cutoff jump). Larger = longer reach (16 ≈ whole grid); smaller = tighter, more 2D-looking coupling but weaker net force on centred magnets. Under Hy3 the slider drives the screened-Poisson decay λ instead (smaller λ = longer decay length).">B range:
 				<input type="range" id="magRange" min="2" max="16" step="1" value="8">
-				<span id="magRangeVal">8</span> cells
+				<span id="magRangeVal">8</span> <span id="magRangeUnit">cells</span>
 			</label>
-			<label class="ctrl" title="Let every magnet also emit its own dipole field (⊙/⊗), so magnets push on each other and the B-field view shows their dipoles. Per-item override: the Emit B checkbox on a magnet piston.">
+			<label class="ctrl" id="magEmitAllLbl" title="Let every magnet also emit its own dipole field (⊙/⊗), so magnets push on each other and the B-field view shows their dipoles. Per-item override: the Emit B checkbox on a magnet piston. Ar engine only.">
 				<input type="checkbox" id="magEmitAll"> Magnets emit B
+			</label>
+			<label class="ctrl" id="magDipolesLbl" style="display:none" title="Hy3 engine only: let every magnet inject its own dipole into the screened-Poisson source so magnets push on each other (self-field cancellation keeps a dipole from feeling itself).">
+				<input type="checkbox" id="magDipoles"> Magnets inject dipoles
 			</label>
 			<label class="ctrl">Metal R:
 				<input type="range" id="metalR" min="1" max="200" step="1" value="20">
@@ -415,6 +419,7 @@
 	<script src="js/network.js"></script>
 	<script src="js/render.js"></script>
 	<script src="js/electric.js"></script>
+	<script src="js/magfield_diffusion.js"></script>
 	<script src="js/air.js"></script>
 	<script src="js/ui.js"></script>
 </body>

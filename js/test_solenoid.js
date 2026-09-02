@@ -59,7 +59,7 @@ const sandbox = {
 };
 vm.createContext(sandbox);
 
-const files = ['state.js', 'maze.js', 'network.js', 'render.js', 'air.js', 'electric.js', 'ui.js'];
+const files = ['state.js', 'maze.js', 'network.js', 'render.js', 'air.js', 'electric.js', 'magfield_diffusion.js', 'ui.js'];
 const jsDir = fs.existsSync(path.join(__dirname, 'state.js')) ? __dirname : path.join(__dirname, 'js');
 for (const f of files) {
 	const src = fs.readFileSync(path.join(jsDir, f), 'utf8');
@@ -358,6 +358,26 @@ runCode(`
 const arb2 = sandbox.__arb2;
 assert(arb2.engine === 'direct', `Test 5b ran on the legacy engine (got ${arb2.engine})`);
 assert(Math.abs(arb2.lastBz - arb2.analytic) < 1e-8, `LEGACY Bz matches analytic kernel (num=${arb2.lastBz.toFixed(5)} an=${arb2.analytic.toFixed(5)})`);
+
+// 5c — Hy3 screened-Poisson engine on the same L-loop scene: a finite,
+// same-sign force. No byte-equality with Ar — Hy3's lambda-tunable decay
+// and self-field cancellation give a different field shape.
+runCode(`magEngine = 'hy3'; MAG_LAMBDA = 0.15; MAG_DIPOLES = false; magReset(); fieldSimulate();`);
+settle(40);
+runCode(`
+	var mag = pistons[0];
+	globalThis.__hy3c = { F: mag.lastFcoil, Bz: mag.lastBz, engine: magEngine };
+	magEngine = 'diffusion'; magReset(); fieldSimulate();
+`);
+const hy3c = sandbox.__hy3c;
+console.log(`   Hy3 L-loop: F=${hy3c.F.toExponential(2)}, lastBz=${hy3c.Bz.toFixed(3)}`);
+assert(hy3c.engine === 'hy3', `Test 5c ran on the Hy3 engine (got ${hy3c.engine})`);
+assert(Number.isFinite(hy3c.F) && hy3c.F !== 0,
+	`Hy3 produces a finite non-zero force on the L-loop magnet (F=${hy3c.F})`);
+assert(Math.sign(hy3c.F) === Math.sign(arb.F),
+	`Hy3 force has the same sign as the Ar engine on the L-loop (Hy3=${hy3c.F.toExponential(2)}, Ar=${arb.F.toExponential(2)})`);
+assert(Number.isFinite(hy3c.Bz),
+	`Hy3 populates magnet telemetry with a finite lastBz (${hy3c.Bz})`);
 
 // ---- 6. Case A armature bridge ----
 console.log('\n== Test 6: Case A armature bridge ==');

@@ -881,6 +881,7 @@ function magReset() {
 	if (magBzDip) magBzDip.fill(0);
 	if (magSrc) magSrc.fill(0);
 	if (fieldBz) fieldBz.fill(0);
+	if (typeof magDiffusionReset === 'function') magDiffusionReset();
 	magSrcCells = 0; magLastDv = 0;
 }
 
@@ -999,6 +1000,7 @@ function fieldSimulate() {
 	// power projection (see magApplyEmfDiffusion).
 	if (mags.length) {
 		if (magEngine === 'direct') magApplyEmfDirect(mags);
+		else if (magEngine === 'hy3') { /* Phase 1: no e.E injection; see Phase 2 */ }
 		else {
 			magBuildEdgeCells();
 			magBuildCoupling(mags);
@@ -1252,6 +1254,15 @@ function fieldPublish() {
 	const mags = magnetList();
 	if (magEngine === 'direct') {
 		magSolveDirect(mags, Ngrid);
+	} else if (magEngine === 'hy3' && (mags.length || colorView === 'bfield')) {
+		// Hy3 screened-Poisson engine (js/magfield_diffusion.js). The
+		// field-advance is the only step Hy3 needs from this site; its
+		// publish() updates magnet telemetry. Internal MAG_SWEEPS = 40
+		// (declared in the file) is used only for self-field convergence;
+		// per-frame relaxation uses Ar's MAG_SWEEPS_PER_FRAME (50).
+		magDiffusionBuildSource();
+		magDiffusionRelax(MAG_SWEEPS_PER_FRAME);
+		magDiffusionPublish(mags);
 	} else if (mags.length || colorView === 'bfield') {
 		// The diffused field only needs advancing when something can read it:
 		// a magnet (force / EMF / telemetry) or the B-field view.
