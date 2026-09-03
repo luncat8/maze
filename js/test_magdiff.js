@@ -1,6 +1,9 @@
-// Headless tests for the Ar DIFFUSION magnetic-field engine (magEngine='ar').
-// and for the legacy 'direct' engine kept beside it.
-// See 12-plan-magnetic-diffusion.md.
+// Headless tests for the magnetic engines:
+//   'tapered'  — analytic-tapered diffusion (js/electric.js)
+//   'diffusion'— explicit forward-Euler cell-to-cell diffusion (default)
+//   'hy3'      — Hy3 screened-Poisson (js/magBzPoissonHy3.js)
+//   'direct'   — legacy per-frame Biot–Savart (obsolete, regression only)
+// See .kilo/plans/1788383164355-add-diffusion-engine.md.
 // Run: node js/test_magdiff.js
 
 const fs = require('fs');
@@ -61,7 +64,7 @@ const sandbox = {
 };
 vm.createContext(sandbox);
 
-const files = ['state.js', 'maze.js', 'network.js', 'render.js', 'air.js', 'electric.js', 'magfield_diffusion.js', 'ui.js'];
+const files = ['state.js', 'maze.js', 'network.js', 'render.js', 'air.js', 'electric.js', 'magBzPoissonHy3.js', 'magfield_diffusion.js', 'ui.js'];
 const jsDir = fs.existsSync(path.join(__dirname, 'state.js')) ? __dirname : path.join(__dirname, 'js');
 for (const f of files) {
 	const src = fs.readFileSync(path.join(jsDir, f), 'utf8');
@@ -97,7 +100,7 @@ function clearBoard() {
 		fieldSystems = [];
 		if (fieldV) fieldV.fill(0);
 		magReset();
-		MAG_RANGE = 8; magEmitAll = false; magEngine = 'ar';
+		MAG_RANGE = 8; magEmitAll = false; magEngine = 'tapered';
 	`);
 }
 // Rail pair + battery in an open chamber, magnet riding the centre line.
@@ -128,12 +131,12 @@ function step(frames, relaxPerFrame) {
 
 // ---- 1. engine selection ----------------------------------------------
 console.log('\n== 1. Engine selection ==');
+assert(getRef('magEngine') === 'diffusion', `'diffusion' is the default magnetic engine (got ${getRef('magEngine')})`);
 clearBoard();
-assert(getRef('magEngine') === 'ar', `ar is the default magnetic engine (got ${getRef('magEngine')})`);
 runCode(`magEngine = 'direct';`);
 assert(typeof getRef('magSolveDirect') === 'function' && typeof getRef('magSolveDiffusion') === 'function',
 	'both magnetic solvers are present');
-runCode(`magEngine = 'ar';`);
+runCode(`magEngine = 'tapered';`);
 
 // ---- 2. relaxed field reproduces the analytic kernel -------------------
 console.log('\n== 2. Relaxed field == windowed analytic kernel ==');
@@ -188,7 +191,7 @@ assert(warm.dv[0] > 0 && warm.dv[warm.dv.length - 1] < warm.dv[0],
 	`the field is a LIVING relaxation: max|dv| ${warm.dv[0].toExponential(2)} on the first frame after the change, ${warm.dv[warm.dv.length - 1].toExponential(2)} once converged`);
 // 3b. With no sources at all the relaxed steady state IS exactly zero, so the
 // solver snaps the buffer instead of decaying for ~1000 sweeps. This is the one
-// place the diffusion engine is discontinuous, and it is exactly where the
+// place the 'tapered' engine is discontinuous, and it is exactly where the
 // legacy engine is discontinuous too (it also drops to 0 when the current goes).
 runCode(`
 	manualBatteries.length = 0;
@@ -242,7 +245,7 @@ runCode(`
 	magEngine = 'direct'; magReset();
 	for (var s = 0; s < 40; s++) { fieldSimulate(); fieldRelax(50); fieldPublish(); }
 	globalThis.__legProf = sweep(); globalThis.__legRough = rough(globalThis.__legProf);
-magEngine = 'ar'; magReset();
+magEngine = 'tapered'; magReset();
 `);
 const cut = { diff: sandbox.__diffProf, leg: sandbox.__legProf, dr: sandbox.__diffRough, lr: sandbox.__legRough };
 console.log(`   diffusion Bz(d=1..14): ${cut.diff.map(v => v.toFixed(2)).join(' ')}`);
@@ -254,7 +257,7 @@ assert(cut.leg.some(v => v === 0) && cut.diff.every(v => v > 0),
 	`the legacy field dies completely in the mid-gap while the diffused field keeps a smooth tail (legacy min ${Math.min(...cut.leg).toFixed(3)}, diffusion min ${Math.min(...cut.diff).toFixed(3)})`);
 
 // ---- 5. energy identity ------------------------------------------------
-console.log('\n== 5. Energy identity Σ E·I + Σ F·v = 0 (diffusion engine) ==');
+console.log('\n== 5. Energy identity Σ E·I + Σ F·v = 0 (tapered engine) ==');
 clearBoard();
 railScene({ magX: 20 });          // off-centre: a strong, non-cancelling coupling
 runCode(`pistons[0].vel = -2.5;`);  // driven against the coil force => generator
@@ -369,7 +372,7 @@ runCode(`
 		}
 		return { F: pistons[0].lastFcoil, B: pistons[0].lastBz, I: pistons[0].lastCurrent };
 	}
-	globalThis.__diff = run('ar');
+	globalThis.__diff = run('tapered');
 	globalThis.__clearedPeak = 0;
 	for (var i = 0; i < fieldBz.length; i++) globalThis.__clearedPeak = Math.max(globalThis.__clearedPeak, Math.abs(fieldBz[i]));
 	globalThis.__preLeg = 0;
@@ -381,10 +384,10 @@ const sw = { diff: sandbox.__diff, leg: sandbox.__leg, cleared: sandbox.__preLeg
 assert(sw.cleared === 0, 'magReset() clears the solver state before switching engines');
 assert(Number.isFinite(sw.diff.F) && Number.isFinite(sw.leg.F), 'both engines report a finite force');
 assert(Math.sign(sw.diff.F) === Math.sign(sw.leg.F) && Math.abs(sw.diff.F) > 1e-4,
-	`both engines push the same way (diffusion F=${sw.diff.F.toExponential(3)} N, direct F=${sw.leg.F.toExponential(3)} N)`);
+	`both engines push the same way (tapered F=${sw.diff.F.toExponential(3)} N, direct F=${sw.leg.F.toExponential(3)} N)`);
 assert(Math.abs(sw.diff.I - sw.leg.I) < 1e-6 * Math.abs(sw.diff.I) + 1e-12,
 	`the shared electric solve is untouched by the magnetic engine (I: ${sw.diff.I.toFixed(6)} vs ${sw.leg.I.toFixed(6)} A)`);
-runCode(`magEngine = 'ar'; magReset();`);
+runCode(`magEngine = 'tapered'; magReset();`);
 
 // ---- 9. range slider ----------------------------------------------------
 console.log('\n== 9. B range slider ==');
@@ -411,9 +414,9 @@ assert(Math.abs(rr.mid) > 0 && Math.abs(rr.near) > Math.abs(rr.mid),
 console.log('\n== 10. Hy3 screened-Poisson engine ==');
 // Three small tests covering: a magnet picks up a finite force on a rail
 // scene, MAG_DIPOLES flips a magnet↔magnet coupling on/off cleanly, and the
-// engine round-trips back to 'ar' without leaving the warm-start buffer
-// stuck. Hy3's magDiffusionPublish does not write e.E on fieldEdges (Phase 1
-// limitation), so we don't assert anything EMF-related here.
+// engine round-trips back to 'tapered' without leaving the warm-start buffer
+// stuck. Hy3's magBzPoissonHy3Publish does not write e.E on fieldEdges
+// (Phase 1 limitation), so we don't assert anything EMF-related here.
 
 // 10a — rail scene under Hy3: finite force + non-zero Bz overlay.
 clearBoard();
@@ -460,7 +463,7 @@ runCode(`
 	magReset();
 	for (var s = 0; s < 40; s++) { fieldSimulate(); fieldRelax(50); fieldPublish(); }
 	globalThis.__hy3bOff = pistons.map(p => p.lastFcoil);
-	MAG_DIPOLES = true; magDiffusionReset();
+	MAG_DIPOLES = true; magBzPoissonHy3Reset();
 	for (var s = 0; s < 40; s++) { fieldSimulate(); fieldRelax(50); fieldPublish(); }
 	globalThis.__hy3bOn = pistons.map(p => p.lastFcoil);
 `);
@@ -479,20 +482,20 @@ const maxF = Math.max(Math.abs(hy3bOn[0]), Math.abs(hy3bOn[1]));
 assert(res < 2 * maxF,
 	`...and the action-reaction residual is bounded (|F_left + F_right|=${res.toFixed(3)} < 2·|F|max=${(2*maxF).toFixed(3)}; strict ≈0 is a Phase 2 tuning item)`);
 
-// 10c — engine round-trips back to 'ar' cleanly.
+// 10c — engine round-trips back to 'tapered' cleanly.
 runCode(`
-	magEngine = 'ar'; magReset();
+	magEngine = 'tapered'; magReset();
 	MAG_RANGE = 8; MAG_LAMBDA = 0.15;
 	fieldSimulate();
 	for (var s = 0; s < 20; s++) { fieldSimulate(); fieldRelax(50); fieldPublish(); }
 	globalThis.__hy3c = { F: pistons.length ? pistons[0].lastFcoil : 0, Bz: pistons.length ? pistons[0].lastBz : 0 };
 `);
 const hy3c = sandbox.__hy3c;
-console.log(`   back to ar: F=${hy3c.F.toExponential(2)}, lastBz=${hy3c.Bz.toFixed(3)}`);
+console.log(`   back to tapered: F=${hy3c.F.toExponential(2)}, lastBz=${hy3c.Bz.toFixed(3)}`);
 assert(Number.isFinite(hy3c.F),
-	`switching back to 'ar' leaves a finite force on the next frame (F=${hy3c.F})`);
-assert(getRef('magEngine') === 'ar',
-	`magEngine round-trips to 'ar' (got ${getRef('magEngine')})`);
+	`switching back to 'tapered' leaves a finite force on the next frame (F=${hy3c.F})`);
+assert(getRef('magEngine') === 'tapered',
+	`magEngine round-trips to 'tapered' (got ${getRef('magEngine')})`);
 
 // ---- 11. why the force is NOT read off the relaxed grid ----------------
 console.log('\n== 11. Grid owns values, analytic kernel owns derivatives ==');
@@ -505,6 +508,7 @@ console.log('\n== 11. Grid owns values, analytic kernel owns derivatives ==');
 // should be revisited — not silently "fixed" by loosening the numbers.
 clearBoard();
 railScene();                 // magnet centred between two opposite rails
+runCode(`magEngine = 'tapered'; magReset();`);
 step(60);
 runCode(`
 	var m = pistons[0], c = bodyCenter(m), hat = bodyHat(m), sig2 = SIGMA_B * SIGMA_B;

@@ -59,7 +59,7 @@ const sandbox = {
 };
 vm.createContext(sandbox);
 
-const files = ['state.js', 'maze.js', 'network.js', 'render.js', 'air.js', 'electric.js', 'magfield_diffusion.js', 'ui.js'];
+const files = ['state.js', 'maze.js', 'network.js', 'render.js', 'air.js', 'electric.js', 'magBzPoissonHy3.js', 'magfield_diffusion.js', 'ui.js'];
 const jsDir = fs.existsSync(path.join(__dirname, 'state.js')) ? __dirname : path.join(__dirname, 'js');
 for (const f of files) {
 	const src = fs.readFileSync(path.join(jsDir, f), 'utf8');
@@ -211,6 +211,7 @@ assert(ch.airA === false, 'fully occupied cells are non-air (hermetic)');
 // ---- 3. field from a single wire (loop with one long side) ----
 console.log('\n== Test 3: field from a current-carrying wire ==');
 clearBoard();
+runCode(`magEngine = 'tapered'; magReset();`);
 runCode(`
 	for (let x = 4; x <= 20; x++) grid[10 * GRID_W + x] = 0;
 	for (let y = 10; y <= 14; y++) { grid[y * GRID_W + 4] = 0; grid[y * GRID_W + 20] = 0; }
@@ -292,6 +293,7 @@ assert(Number.isFinite(rails.Bend), `Bz at the rail end is finite (Bend=${rails.
 // ---- 5. arbitrary geometry: L-shaped run matches analytic kernel ----
 console.log('\n== Test 5: arbitrary geometry (no pattern matching) ==');
 clearBoard();
+runCode(`magEngine = 'tapered'; magReset();`);
 runCode(`
 	const rc = (x, y) => y * GRID_W + x;
 	for (let x = 6; x <= 14; x++) grid[rc(x, 12)] = 0;
@@ -310,7 +312,7 @@ runCode(`
 	fieldSimulate();
 `);
 settle(60);
-// 5a — default (diffusion) engine: the relaxed field must reproduce the same
+// 5a — default (tapered) engine: the relaxed field must reproduce the same
 // analytic kernel up to its smooth MAG_RANGE taper. Exact equality is the
 // LEGACY contract, checked in 5b with the engine pinned to 'direct' (the same
 // way test_electric_demo.js pins activeEngine='circuit' for the nodal engine).
@@ -353,7 +355,7 @@ runCode(`
 		Bz += K_B * e.I * magKernelG(e.dlx, e.dly, rx, ry, sig2);
 	}
 	globalThis.__arb2 = { lastBz: mag.lastBz, analytic: Bz, engine: magEngine };
-	magEngine = 'diffusion'; magReset(); fieldSimulate();
+	magEngine = 'tapered'; magReset(); fieldSimulate();
 `);
 const arb2 = sandbox.__arb2;
 assert(arb2.engine === 'direct', `Test 5b ran on the legacy engine (got ${arb2.engine})`);
@@ -367,7 +369,7 @@ settle(40);
 runCode(`
 	var mag = pistons[0];
 	globalThis.__hy3c = { F: mag.lastFcoil, Bz: mag.lastBz, engine: magEngine };
-	magEngine = 'diffusion'; magReset(); fieldSimulate();
+	magEngine = 'tapered'; magReset(); fieldSimulate();
 `);
 const hy3c = sandbox.__hy3c;
 console.log(`   Hy3 L-loop: F=${hy3c.F.toExponential(2)}, lastBz=${hy3c.Bz.toFixed(3)}`);
@@ -375,7 +377,7 @@ assert(hy3c.engine === 'hy3', `Test 5c ran on the Hy3 engine (got ${hy3c.engine}
 assert(Number.isFinite(hy3c.F) && hy3c.F !== 0,
 	`Hy3 produces a finite non-zero force on the L-loop magnet (F=${hy3c.F})`);
 assert(Math.sign(hy3c.F) === Math.sign(arb.F),
-	`Hy3 force has the same sign as the Ar engine on the L-loop (Hy3=${hy3c.F.toExponential(2)}, Ar=${arb.F.toExponential(2)})`);
+	`Hy3 force has the same sign as the tapered engine on the L-loop (Hy3=${hy3c.F.toExponential(2)}, tapered=${arb.F.toExponential(2)})`);
 assert(Number.isFinite(hy3c.Bz),
 	`Hy3 populates magnet telemetry with a finite lastBz (${hy3c.Bz})`);
 

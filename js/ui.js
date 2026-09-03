@@ -31,7 +31,6 @@ function setColorView(v) {
 		if (magnetList().length || electricActive()) {
 			fieldSimulate();
 			fieldRelax(FIELD_SWEEPS_PER_FRAME);
-			fieldSimulate();
 			fieldPublish();
 		}
 	}
@@ -685,12 +684,15 @@ els.cooling.onchange = () => { coolingEnabled = els.cooling.checked; startSimLoo
 // medium resistance slider.
 const engineSel = document.getElementById('engineSel');
 if (engineSel) engineSel.onchange = () => { activeEngine = engineSel.value; recompute(); updateStatus(); };
-// Magnetic engine selector: 'ar' (default analytic diffusion), 'hy3'
-// (screened-Poisson, separate file), 'direct' (legacy per-frame Biot–Savart
-// sum). Switching drops the solver state so the engines never share a
-// half-warm field. Also re-binds the B-range slider between MAG_RANGE (Ar,
-// cells) and MAG_LAMBDA (Hy3, screened-Poisson decay), and toggles the
-// "Magnets emit B" (Ar) vs "Magnets inject dipoles" (Hy3) controls.
+// Magnetic engine selector: 'diffusion' (forward-Euler cell-to-cell
+// relaxation, default; see js/state.js:184), 'tapered' (analytic-tapered
+// diffusion), 'hy3' (screened-Poisson, separate file), 'direct' (legacy
+// per-frame Biot–Savart sum). Switching drops the solver state so the
+// engines never share a half-warm field. Also re-binds the B-range slider
+// between MAG_RANGE ('tapered', cells), MAG_LAMBDA ('hy3', screened-Poisson
+// decay), and MAG_DIFFUSION_ALPHA ('diffusion', per-step diffusion rate),
+// and toggles the "Magnets emit B" ('tapered') vs "Magnets inject dipoles"
+// ('hy3') controls.
 const magEngineSel = document.getElementById('magEngineSel');
 const magRangeUnit = document.getElementById('magRangeUnit');
 const magEmitAllLbl = document.getElementById('magEmitAllLbl');
@@ -709,12 +711,20 @@ function magEngineOnChange() {
 		if (magRangeUnit) magRangeUnit.textContent = 'λ';
 		if (magEmitAllLbl) magEmitAllLbl.hidden = true;
 		if (magDipolesLbl) magDipolesLbl.hidden = false;
-	} else if (magEngine === 'ar') {
+	} else if (magEngine === 'tapered') {
 		slider.min = 2; slider.max = 16; slider.step = 1;
 		slider.value = MAG_RANGE;
 		if (readout) readout.textContent = MAG_RANGE;
 		if (magRangeUnit) magRangeUnit.textContent = 'cells';
 		if (magEmitAllLbl) magEmitAllLbl.hidden = false;
+		if (magDipolesLbl) magDipolesLbl.hidden = true;
+	} else if (magEngine === 'diffusion') {
+		slider.min = 0.02; slider.max = 0.24; slider.step = 0.01;
+		const v = +MAG_DIFFUSION_ALPHA.toFixed(2);
+		slider.value = v;
+		if (readout) readout.textContent = v.toFixed(2);
+		if (magRangeUnit) magRangeUnit.textContent = 'α';
+		if (magEmitAllLbl) magEmitAllLbl.hidden = true;
 		if (magDipolesLbl) magDipolesLbl.hidden = true;
 	} else { // 'direct'
 		slider.min = 2; slider.max = 16; slider.step = 1;
@@ -727,9 +737,10 @@ function magEngineOnChange() {
 	magReset();
 	recompute();
 	updateStatus();
-	const tag = magEngine === 'direct' ? 'direct Biot–Savart sum (obsolete)'
-	          : magEngine === 'hy3'   ? 'Hy3 screened-Poisson'
-	          :                          'Ar analytic diffusion';
+	const tag = magEngine === 'direct'    ? 'Direct (obsolete)'
+	          : magEngine === 'hy3'        ? 'Diffusion-Hy3 (screened)'
+	          : magEngine === 'tapered'    ? 'Diffusion-Ar (tapered)'
+	          :                               'Diffusion (visual relaxation)';
 	logger('Magnetic engine: ' + tag, 'sys');
 }
 if (magEngineSel) {
@@ -743,11 +754,14 @@ if (magRangeSlider) magRangeSlider.oninput = () => {
 	const v = +magRangeSlider.value;
 	if (magEngine === 'hy3') {
 		MAG_LAMBDA = v;
+		if (typeof magBzPoissonHy3Reset === 'function') magBzPoissonHy3Reset();
+	} else if (magEngine === 'diffusion') {
+		MAG_DIFFUSION_ALPHA = v;
 		if (typeof magDiffusionReset === 'function') magDiffusionReset();
 	} else {
 		MAG_RANGE = v;
 	}
-	if (magRangeVal) magRangeVal.textContent = magEngine === 'hy3' ? v.toFixed(2) : v;
+	if (magRangeVal) magRangeVal.textContent = magEngine === 'hy3' || magEngine === 'diffusion' ? v.toFixed(2) : v;
 	startSimLoop();
 };
 const magEmitChk = document.getElementById('magEmitAll');
@@ -757,7 +771,7 @@ if (magEmitChk) magEmitChk.onchange = () => {
 };
 if (magDipolesChk) magDipolesChk.onchange = () => {
 	MAG_DIPOLES = magDipolesChk.checked;
-	if (typeof magDiffusionReset === 'function') magDiffusionReset();
+	if (typeof magBzPoissonHy3Reset === 'function') magBzPoissonHy3Reset();
 	if (magnetList().length) { fieldSimulate(); startSimLoop(); }
 };
 const metalRSlider = document.getElementById('metalR');
@@ -773,6 +787,7 @@ const metalRSlider = document.getElementById('metalR');
   	K_B = +kbSlider.value;
   	if (kbVal) kbVal.textContent = kbSlider.value;
   	if (magnetList().length) { fieldSimulate(); startSimLoop(); }
+  	else if (electricActive()) scheduleFieldRecompute();
   };
   const batRSlider = document.getElementById('batR');
   const batRVal = document.getElementById('batRVal');

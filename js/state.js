@@ -161,13 +161,19 @@ let K_B = 40;           // magnetic kernel gain (slider)
 const SIGMA_B = 0.5;    // soft-core radius (cells)
 const MAG_RMAX = 8;     // kernel cutoff (cells) — LEGACY ('direct') engine only
 
-// Magnetic engine selection. Three engines are selectable:
-//  'ar' (default) — Analytic diffusion: Bz is persistent solver state, relaxed
-//    by red-black Gauss–Seidel every frame from a local source: the discrete
-//    Laplacian of the MAG_RANGE-windowed Biot–Savart field, so the relaxed
-//    field IS that analytic field, smoothly tapered instead of hard-cut.
-//    Warm-started, O(cells) per sweep, no cutoff discontinuity.
-//  'hy3' — Hy3 screened-Poisson (separate file: js/magfield_diffusion.js).
+// Magnetic engine selection. Four engines are selectable:
+//  'tapered' — Analytic-tapered diffusion: Bz is persistent solver
+//    state, relaxed by red-black Gauss–Seidel every frame from a local source:
+//    the discrete Laplacian of the MAG_RANGE-windowed Biot–Savart field, so
+//    the relaxed field IS that analytic field, smoothly tapered instead of
+//    hard-cut. Warm-started, O(cells) per sweep, no cutoff discontinuity.
+//  'diffusion' (default) — Explicit forward-Euler cell-to-cell diffusion.
+//    Bz ← Bz + α·(sum of 4 neighbors − 4·Bz) + S, run for MAG_SWEEPS_PER_FRAME
+//    iterations per frame. Source S is the discrete curl of the edge
+//    currents, computed in-file from fieldEdges. The field actually spreads
+//    between cells frame-by-frame; higher α ⇒ faster spread, lower peak.
+//    No back-EMF injection in this plan.
+//  'hy3' — Hy3 screened-Poisson (separate file: js/magBzPoissonHy3.js).
 //    Solves (∇² − λ²) Bz = S for the curl of J + (when MAG_DIPOLES) each
 //    magnet's own dipole. Range is λ (1/λ = decay length), no hard cutoff.
 //    Warm-started, with self-field cancellation so a magnet exerts no force on
@@ -175,20 +181,26 @@ const MAG_RMAX = 8;     // kernel cutoff (cells) — LEGACY ('direct') engine on
 //  'direct' — OBSOLETE legacy path: per-frame Biot–Savart summation over
 //    every current edge for every magnet, with a hard MAG_RMAX cutoff. Kept
 //    selectable for regression/comparison; no new features planned.
-let magEngine = 'ar';
+let magEngine = 'diffusion';
 // Field radius (cells) of the diffused engine: the kernel is tapered smoothly
 // to zero here instead of being hard-cut (the legacy MAG_RMAX jump). Measured
 // on the solenoid scenes: the net force is a small residue of large cancelling
 // near-field terms, so it flips sign below ~7 cells — hence the default keeps
 // the legacy 8-cell radius and lets the taper do the shortening (w(6) ≈ 0.19).
 let MAG_RANGE = 8;
-const MAG_SWEEPS_PER_FRAME = 50;      // B relaxation steps advanced each frame
+const MAG_SWEEPS_PER_FRAME = 50;      // magnetic-field (Bz) relaxation steps per frame;
 let magEmitAll = false;               // master switch: every magnet emits its dipole field
 const MAG_EMIT_R = 3;                 // dipole source window (cells) around a body
 
-// Hy3 engine tuning ('hy3' in magEngine). See js/magfield_diffusion.js.
+// Hy3 engine tuning ('hy3' in magEngine). See js/magBzPoissonHy3.js.
 let MAG_LAMBDA = 0.15;                // screened-Poisson decay (1/λ = decay length in cells)
 let MAG_DIPOLES = false;              // 'hy3': magnets also inject their own dipole source
+
+// Diffusion engine tuning ('diffusion' in magEngine). See js/magfield_diffusion.js
+// (the new visual-relaxation engine; Hy3's file is js/magBzPoissonHy3.js).
+// Per-step forward-Euler rate; the slider caps at 0.24 (CFL requires
+// 4·α ≤ 1, and 0.25 is exactly marginal — see magfield_diffusion.js).
+let MAG_DIFFUSION_ALPHA = 0.20;
 
 function bodyMoveAxis(b) { return b.moveAxis || b.axis; }
 function isCaseA(b) { return !!b.magnet && b.axis && bodyMoveAxis(b) !== b.axis; }
@@ -245,7 +257,7 @@ function createMechanicalBody(spec) {
 		magStrength: spec.magStrength != null ? spec.magStrength : 1,
 		// `emit` makes the body a source of its own dipole field (magnet↔magnet
 		// coupling + a visible dipole in the B-field view). Only meaningful for
-		// magnets, and only the diffusion engine injects it. `magEmitAll` is a
+		// magnets, and only the 'tapered' engine injects it. `magEmitAll` is a
 		// GUI master switch that forces every magnet to emit.
 		emit: !!spec.emit,
 		R_arm: spec.R_arm != null ? spec.R_arm : 2,
@@ -267,7 +279,6 @@ let selectedItem = null;            // selected maze item: { kind: 'lamp'|'wire'
 let lampBaseEff = 100;              // default luminous efficacy (lm/W) for new non-wired lamps
 let lampCutEff = 300;                // efficacy (lm/W) when a lamp cuts a wire (wiring bonus)
 const BATTERY_ENERGY = 20000;       // capacity (J) of an inventory battery
-const CHARGE_RATE = 500;            // energy moved along a connected network (J/s)
 const INFINITE_ENERGY = 1e15;       // capacity (J) of an unlimited/GODMODE source
 const INFINITE_THRESHOLD = 1e12;    // maxEnergy at/above this is treated as "∞"
 
@@ -347,10 +358,9 @@ const N_MIN = 1e-4;                      // floor to avoid divide-by-zero
 const P_SCALE = 1;                       // lumped with R_SPEC for Pa
 const G_FLOW = 2e-5;                     // kg/(Pa·s) pressure-driven mass flux (per face)
 const CFL_FRAC = 0.2;                    // per-face mass cap = CFL_FRAC·N0/dt (strict positivity)
-const SRC_T_DEF = 293, SRC_T_MIN = 0, SRC_T_MAX = 400; // Air Source set temperature (K)
+const SRC_T_DEF = 293;                                // Air Source set temperature (K)
 const SRC_RATE_DEF = 0.01, SINK_RATE_DEF = 0.01;      // Air Source/Sink mass rate (kg/s)
-const PERM = 2;                          // Darcy-like permeability (convection / plume advection)
-const LM_EFFICACY = 100;                 // lm/W for GODMODE self-powered lamp power
+const LM_EFFICACY = 100;                              // lm/W for GODMODE self-powered lamp power
 const T_MAX = 4000;                      // safety clamp on excess temp (K), not a sink
 const VEL_SCALE = 15;                    // visual scale for the Pressure-view flow arrows
 const VEL_CMAX = 1.6;                    // speed cap (cells/s) for arrow field
@@ -387,7 +397,7 @@ function cellOccupied(idx) {
 		|| pipeValves.some(v => v.idx === idx)
 		|| pipePortals.some(p => p.a === idx || p.b === idx)
 		|| pumps.some(p => p.idx === idx)
-	|| pistons.some(p => bodyCells(p).includes(idx))
+		|| pistons.some(p => bodyCells(p).includes(idx))
 		|| manualWires.some(w => w.cells.includes(idx))
 		|| manualBatteries.some(b => b.poles.includes(idx));
 }
@@ -506,7 +516,8 @@ function updateStatus(x, y) {
   const engineName = activeEngine === 'field' ? 'Field' : 'Circuit (obsolete)';
   const magName = magEngine === 'direct' ? 'Direct (obsolete)'
                 : magEngine === 'hy3'     ? 'Diffusion-Hy3 (screened)'
-                :                           'Diffusion-Ar (analytic)';
+                : magEngine === 'tapered' ? 'Diffusion-Ar (tapered)'
+                :                           'Diffusion (visual relaxation)';
   const viewName = colorView === 'net' ? 'Net' : colorView === 'electric' ? 'Electric' : colorView === 'voltage' ? 'Voltage' : colorView === 'heat' ? 'Heat' : colorView === 'pressure' ? 'Pressure' : colorView === 'bfield' ? 'B-field' : 'Light';
   statusBar.textContent = `Tool: ${tn}   |   Cell: ${ci}   |   Type: ${ti}${extra}   |   Net: ${selectedColor}   |   View: ${viewName}   |   Engine: ${engineName}   |   Mag: ${magName}   |   T: ${tStr}   |   P: ${pStr}`;
 }

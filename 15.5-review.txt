@@ -1,0 +1,92 @@
+
+## Blocker first: the workspace is down, so nothing was written this turn
+
+Every `bash`, `read_file`, `write_file`, and `start_process` call I made returned the same error — `Failed to initialize E2B workspace`. I retried ~20 times across the turn (including different `cwd`s and long timeouts). I cannot read the repo, edit files, run `node js/test_*.js`, or use `git`. **So: no implementation, no file writes, no test runs.** I'm not going to describe that as done.
+
+What I could do is read the repo over the network. I confirmed `main` is at `f241be082db63e20d7e6736b223ac40207b7b2b9` — exactly the base commit of `arena/01a064eb-maze` — so what I read matches your working tree. Verified by direct read: `15.5-plan-fix.md` (7,024 B), `16-plan-add-diffusion-engine.md` (55,187 B), `js/magfield_diffusion.js` (5,765 B), `js/magBzPoissonHy3.js` (10,498 B), `README.md`, and the `js/` manifest. Not read (too large to pull blind, and I won't guess at them): `js/ui.js` (104,577 B), `js/electric.js` (61,953 B), `js/state.js` (30,919 B), `js/test_magdiff.js` (29,423 B), `index.html`.
+
+Here is the review, with each finding marked by what actually backs it.
+
+---
+
+## Findings on `16-plan-add-diffusion-engine.md`
+
+### A. Test 11b is the plan's headline proof, and it proves nothing — the numbers say so
+
+The plan asserts: *"the peak under α=0.20 should be LOWER than the peak under α=0.05 … This is the test that proves the diffusion is real: an instant Poisson solve would give equal peaks."*
+
+That reasoning is wrong. The implemented update (`js/magfield_diffusion.js`, verified) is
+
+```js
+const nv = bz + alpha * (sum - 4 * bz) + magSrcDiff[i];
+```
+
+with a zero Dirichlet border. Its **steady state** satisfies `α·∇²Bz + S = 0`, i.e. `∇²Bz = −S/α`, so the settled amplitude scales as **1/α** — not as a decay rate. The plan's own smoke number confirms it to 0.13%:
+
+| α | peak | peak · α |
+|---|---|---|
+| 0.05 | 23.09 | 1.1545 |
+| 0.20 | 5.78 | 1.1560 |
+
+Ratio 23.09/5.78 = **3.994**, versus 0.20/0.05 = **4**. Both runs had already reached steady state; the peaks differ purely by the 1/α Poisson factor. An "instant Poisson solve" of the same equation gives *exactly* these two peaks, so 11b cannot discriminate transient from steady-state. **Fix:** hold α fixed and vary the advance count — `peak(5 sweeps) < peak(50) < peak(500)`, monotone toward the asymptote. That is the test an instant solver fails.
+
+### B. `S` is a per-step increment, so α does double duty — speed *and* force amplitude
+
+Same line: `magSrcDiff[i]` is added on **every** one of the `sweeps` iterations with no `dt`. Consequence, which neither plan states: settled `peak ∝ K_B/α`, independent of sweep count. So `MAG_SWEEPS_PER_FRAME` only changes the *lag*, while α changes both speed and the settled force — **4× between the two ends of the slider**. Dragging "diffusion rate" therefore silently rescales every magnet force. That is a real UX/physics defect the plan missed.
+
+**Fix:** `next = bz + α·lap + dt·(K_B · MAG_SRC_GAIN_DIFF · curlJ)` with `dt` fixed, and normalise the source by `α/α_ref` so `∇²Bz = −S₀/α_ref` is α-independent. α then controls *only* the relaxation time, and a separate `MAG_SRC_GAIN_DIFF` (the Russian critique in the plan already asks for it — it is genuinely absent: the code scales by `K_B` alone) controls amplitude.
+
+### C. α = 0.25 is exactly marginal, not just "borderline"
+
+Verified: `if (MAG_DIFFUSION_ALPHA > 0.25) { console.warn(…'violates CFL (4·α < 1)'); MAG_DIFFUSION_ALPHA = 0.25; }`, slider max `0.25`. The amplification factor is `g = 1 − 2α(2 − cos kx − cos ky)`, worst case `g = 1 − 8α` at the Nyquist mode. Stability needs `α ≤ 0.25`; **at α = 0.25 exactly, g = −1** — a neutrally stable checkerboard that never damps. Any noise in `S` becomes a permanent 1-cell flicker in the B-field view. The plan's own `4·α < 1` comment contradicts its `max = 0.25`. Cap at **0.24** (`g = −0.92`), which is what the appended critique recommends — now with the reason attached. (No NaN risk: the `isFinite(nv) ? nv : 0` guard is present.)
+
+### D. The clamp mutates the user's global
+
+`magDiffusionRelax` assigns `MAG_DIFFUSION_ALPHA = 0.25` — rewriting the user's setting from inside the solver and desyncing the slider from the live value. Use a local `const alpha = Math.min(MAG_DIFFUSION_ALPHA, 0.24)`. Neither plan mentions this.
+
+### E. Diffusion has no dipole support, and the UI just hides the toggle
+
+Verified by reading both files: `magBzPoissonHy3BuildSource` calls `injectDipoleSource(mag, magSrcHy3, 1)` when `MAG_DIPOLES`; `magDiffusionBuildSource` has no dipole injection at all, and correspondingly no `needSelf` self-force subtraction. Task 8 hides `#magDipoles` under `diffusion`. So with dipoles enabled, switching to `diffusion` makes magnets lose their intrinsic field and respond to wires only — a discontinuous change in the force law, listed nowhere in the plan's Risks. Either implement dipoles as an added warm-started source (and bring the self-subtraction with them, or magnets self-force), or document it as a known limitation with a visible hint.
+
+### F. The 40-line publish duplication is verbatim, and it's the highest-value refactor
+
+`magDiffusionPublish` is `magBzPoissonHy3Publish` minus the `needSelf` block, plus a `fieldBz` copy loop — confirmed by diffing the two sources. Both compute `Eb`, `elecP`, `lastEMF`, `lastHeat` while **neither injects back-EMF** into `e.E`. Extracting one `magPublishTelemetry(mags, bzAt, opts)` kills three deferred items at once: the duplicate publish block, the "EMF telemetry under field-only engines" item 15.5 punts on, and the `edgeIsSelf` comment drift. Both are also **O(M·E)** — each magnet loops all `fieldEdges`. Worth doing before more engines accrete.
+
+### G. Dead `if/else` in both source builders
+
+In **both** `magDiffusionBuildSource` and `magBzPoissonHy3BuildSource` the `e.dlx === 1` and `else` branches have **identical bodies**. Not a sign bug — the `+I / −I` split is by construction the same — but the comments give them different physical readings ("bottom/top" vs "right/left"), which will mislead the next reader into thinking orientation is handled. Collapse to one statement; keep the explanation in the comment. Related wording: the operator is the signed incidence of edge currents onto endpoint cells (a divergence-shaped operator that Stokes identifies with circulation density). Hy3's comment says this carefully; the 16-plan repeatedly says "discrete curl of the edge currents," which is loose.
+
+---
+
+## Findings on `15.5-plan-fix.md`
+
+### H. Item #1 is not a behavioural no-op under the new default engine
+
+This is the sharpest problem in 15.5. The plan's whole framing is *"No physics edits. All fixes are behavioural no-ops."* Item #1 deletes a second `fieldSimulate()` call. Per 16-plan task 7, the diffusion advance runs **inside** `fieldSimulate()` — `magDiffusionRelax(MAG_SWEEPS_PER_FRAME)` in the field-advance step. So each `fieldSimulate()` advances the field by 50 diffusion steps, and removing one call removes 50 steps. For a steady-state solver that's invisible; for the **transient** engine that is now the default, it's a measurable change in the published field — large from a cold start. The fix is probably still correct (matching the sibling call sites), but the plan must reclassify it as a behaviour change and require the test suite to be re-run. *(Reasoning from the plan's own description of the code plus the verified `magfield_diffusion.js`; I could not read `js/ui.js` to confirm the call sequence.)*
+
+### I. The plan's validation grep mentions a symbol that appears in none of its 11 fixes
+
+Step 4 says: re-run `rg "CHARGE_RATE|SRC_T_MIN|SRC_T_MAX|PERM\b" js/`, expect 0 matches. Item #9 deletes only `SRC_T_MIN`, `SRC_T_MAX`, `PERM`. `CHARGE_RATE` is in the grep but nowhere in the fix table. Either it's a dead constant and is an undocumented fourth deletion, or it's live and the "expect 0 matches" check fails. Internally inconsistent — resolve before executing.
+
+Also: that grep is scoped to `js/` only, which misses `index.html` — and the plan is separately editing `index.html` in item #11. Widen it to the repo root.
+
+### J. Item #11's stated rationale contradicts itself
+
+The plan says *"The README is descriptive of the project; the title is the browser tab"* — then resolves to make the browser tab read `# Maze simple 2D engine` (verified README line 1) because it "matches the README first-line." Those are different jobs; a tab wants a short product name, and the README is explicitly informal ("implemented mostly by Hy3: refactoring by top LLM will make codebase better"). I'd reverse it: keep the tab title, promote the product name into the README H1. Your call — flagging that the decision was made on reasoning that argues the other way.
+
+### K. Item #3's Issue and Fix columns describe different problems
+
+Issue says the K_B slider "Skips `scheduleFieldRecompute()` while `R_metal` and `R_bat` schedule one." Fix then says that call *"is **already there**"* and the real gap is the no-magnets case, so: add `scheduleFieldRecompute()` only when `magnetList().length === 0`. Defensible logic, but the entry needs rewriting to say one thing, and it's unverified — I could not read `js/ui.js:787-791`.
+
+### L. The "zero risk" claim wasn't checked
+
+The plan asserts no test can break. Item #10 edits an assertion *message*; item #11 edits the document title. If any harness snapshots messages or asserts the title, both break. Grep the tests for the title string before applying. Items #2, #4, #6, #7, #8, #9, #10 all cite specific line numbers I could not verify, so treat every `file:line` in 15.5 as provisional until I can `rg` the tree.
+
+---
+
+## What I still owe you
+
+1. **Implement 15.5** — all 11 items, with the line numbers re-derived from the real tree, item #1 reclassified as a behaviour change, the `CHARGE_RATE` inconsistency resolved, and the full suite (`test_magdiff`, `test_solenoid`, `test_piston_pump`, `test_electric_demo`, `test_scene_copy`, `test_heat`) re-run before and after.
+2. **Write `16.1-plan-add-diffusion-engine.md`** incorporating A–G above: a transient test that actually discriminates, `dt`-scaled source with `MAG_SRC_GAIN_DIFF`, α capped at 0.24, non-mutating clamp, a dipoles decision, and the shared `magPublishTelemetry` extraction.
+
+Both need file writes. **Please send any message to retry** — if the workspace provisions, I'll do the implementation and the 16.1 plan in the same turn and report the actual test counts. If you'd rather I not wait, I can draft the full 16.1 text inline for you to paste.

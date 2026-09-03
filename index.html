@@ -1,7 +1,7 @@
 <!DOCTYPE html>
 <html style="margin:0; overflow:hidden;">
 <head>
-	<title>Maze Network Pro</title>
+	<title>Maze simple 2D engine</title>
 	<style>
 		html, body { height: 100%; margin: 0; }
 		body { background: #1a1a1a; color: #eee; font-family: monospace; overflow: hidden; }
@@ -193,18 +193,19 @@
 					<option value="circuit">Circuit (nodal, obsolete)</option>
 				</select>
 			</label>
-			<label class="ctrl" title="Ar: Bz diffusion from a windowed Biot–Savart source (default, warm-started, smooth). Hy3: screened-Poisson (∇²−λ²)Bz=S — separate lambda-tunable decay; ships without back-EMF in Phase 1. Direct: legacy per-frame Biot–Savart sum with hard MAG_RMAX cutoff (obsolete, regression only).">Magnetics:
+			<label class="ctrl" title="Four magnetic engines. 'tapered' (was 'ar'): Bz diffusion from a windowed Biot–Savart source, warm-started, smooth, with back-EMF. 'diffusion' (default): explicit forward-Euler cell-to-cell relaxation, field-only (no back-EMF), visibly spreads between cells. 'hy3': screened-Poisson (∇²−λ²)Bz=S, separate lambda-tunable decay, field-only. 'direct': legacy per-frame Biot–Savart sum with hard MAG_RMAX cutoff (obsolete, regression only).">Magnetics:
 				<select id="magEngineSel">
-					<option value="ar" selected>Diffusion-Ar (analytic)</option>
+					<option value="tapered">Diffusion-Ar (tapered)</option>
+					<option value="diffusion" selected>Diffusion (visual relaxation)</option>
 					<option value="hy3">Diffusion-Hy3 (screened)</option>
 					<option value="direct">Direct (obsolete)</option>
 				</select>
 			</label>
-			<label class="ctrl" id="magRangeLbl" title="Radius of the Ar diffused magnetic field, in cells: the kernel tapers smoothly to zero here (no hard cutoff jump). Larger = longer reach (16 ≈ whole grid); smaller = tighter, more 2D-looking coupling but weaker net force on centred magnets. Under Hy3 the slider drives the screened-Poisson decay λ instead (smaller λ = longer decay length).">B range:
+			<label class="ctrl" id="magRangeLbl" title="Engine-specific control bound to the same slider. 'tapered': radius of the diffused field in cells (the kernel tapers smoothly to zero here; no hard cutoff jump). Larger = longer reach (16 ≈ whole grid). 'hy3': the screened-Poisson decay λ (smaller λ = longer decay length). 'diffusion': the per-step forward-Euler rate α (CFL requires 4·α < 1; higher α spreads the field faster per iteration).">B range:
 				<input type="range" id="magRange" min="2" max="16" step="1" value="8">
 				<span id="magRangeVal">8</span> <span id="magRangeUnit">cells</span>
 			</label>
-			<label class="ctrl" id="magEmitAllLbl" title="Let every magnet also emit its own dipole field (⊙/⊗), so magnets push on each other and the B-field view shows their dipoles. Per-item override: the Emit B checkbox on a magnet piston. Ar engine only.">
+			<label class="ctrl" id="magEmitAllLbl" title="Let every magnet also emit its own dipole field (⊙/⊗), so magnets push on each other and the B-field view shows their dipoles. Per-item override: the Emit B checkbox on a magnet piston. Tapered engine only.">
 				<input type="checkbox" id="magEmitAll"> Magnets emit B
 			</label>
 			<label class="ctrl" id="magDipolesLbl" style="display:none" title="Hy3 engine only: let every magnet inject its own dipole into the screened-Poisson source so magnets push on each other (self-field cancellation keeps a dipole from feeling itself).">
@@ -350,7 +351,7 @@
 			<div data-show="magnet">
 				<div class="prop-sub">Magnet</div>
 				<label class="ctrl"><span>m (dipole)</span><span class="ctrl-val" data-bind="magHead"></span><input type="range" data-input="magStrength" min="-5" max="5" step="0.1" value="1"></label>
-				<label class="ctrl" title="This magnet also emits its own dipole field, so it couples to other magnets (and shows up in the B-field view). Diffusion engine only."><span>Emit B</span><input type="checkbox" data-input="emit"></label>
+				<label class="ctrl" title="This magnet also emits its own dipole field, so it couples to other magnets (and shows up in the B-field view). Tapered engine only."><span>Emit B</span><input type="checkbox" data-input="emit"></label>
 				<label class="ctrl"><span>R_arm (Ω)</span><span class="ctrl-val" data-bind="rArmHead"></span><input type="range" data-input="R_arm" min="0.2" max="20" step="0.1" value="2"></label>
 				<label class="ctrl"><span>Efficiency (%)</span><span class="ctrl-val" data-bind="etaHead"></span><input type="range" data-input="efficiency" min="0" max="100" step="1" value="85"></label>
 				<div class="prop-row"><span>Bz</span><span data-bind="bz"></span></div>
@@ -419,6 +420,7 @@
 	<script src="js/network.js"></script>
 	<script src="js/render.js"></script>
 	<script src="js/electric.js"></script>
+	<script src="js/magBzPoissonHy3.js"></script>
 	<script src="js/magfield_diffusion.js"></script>
 	<script src="js/air.js"></script>
 	<script src="js/ui.js"></script>

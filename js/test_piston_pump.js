@@ -64,7 +64,7 @@ vm.createContext(sandbox);
 
 // ---------- Load project files ---------------------------------------------
 
-const files = ['state.js', 'maze.js', 'network.js', 'render.js', 'air.js', 'electric.js', 'magfield_diffusion.js', 'ui.js'];
+const files = ['state.js', 'maze.js', 'network.js', 'render.js', 'air.js', 'electric.js', 'magBzPoissonHy3.js', 'magfield_diffusion.js', 'ui.js'];
 const jsDir = fs.existsSync(path.join(__dirname, 'state.js')) ? __dirname : path.join(__dirname, 'js');
 for (const f of files) {
 	let src = fs.readFileSync(path.join(jsDir, f), 'utf8');
