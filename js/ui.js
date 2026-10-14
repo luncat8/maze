@@ -698,50 +698,49 @@ const magRangeUnit = document.getElementById('magRangeUnit');
 const magEmitAllLbl = document.getElementById('magEmitAllLbl');
 const magDipolesLbl = document.getElementById('magDipolesLbl');
 const magDipolesChk = document.getElementById('magDipoles');
+const magEngineNote = document.getElementById('magEngineNote');
 
+// Per-engine binding (slider range/unit, which toggles are visible, the caveat
+// note) all comes from the shared MAG_ENGINE_UI table in js/state.js, so the
+// status bar and this handler can't drift apart.
 function magEngineOnChange() {
 	magEngine = magEngineSel.value;
+	const ui = magEngineUi();
 	const slider = document.getElementById('magRange');
 	const readout = document.getElementById('magRangeVal');
-	if (magEngine === 'hy3') {
-		slider.min = 0.02; slider.max = 1; slider.step = 0.01;
-		const v = +MAG_LAMBDA.toFixed(2);
-		slider.value = v;
-		if (readout) readout.textContent = v.toFixed(2);
-		if (magRangeUnit) magRangeUnit.textContent = 'λ';
-		if (magEmitAllLbl) magEmitAllLbl.hidden = true;
-		if (magDipolesLbl) magDipolesLbl.hidden = false;
-	} else if (magEngine === 'tapered') {
-		slider.min = 2; slider.max = 16; slider.step = 1;
-		slider.value = MAG_RANGE;
-		if (readout) readout.textContent = MAG_RANGE;
-		if (magRangeUnit) magRangeUnit.textContent = 'cells';
-		if (magEmitAllLbl) magEmitAllLbl.hidden = false;
-		if (magDipolesLbl) magDipolesLbl.hidden = true;
-	} else if (magEngine === 'diffusion') {
-		slider.min = 0.02; slider.max = 0.24; slider.step = 0.01;
-		const v = +MAG_DIFFUSION_ALPHA.toFixed(2);
-		slider.value = v;
-		if (readout) readout.textContent = v.toFixed(2);
-		if (magRangeUnit) magRangeUnit.textContent = 'α';
-		if (magEmitAllLbl) magEmitAllLbl.hidden = true;
-		if (magDipolesLbl) magDipolesLbl.hidden = true;
-	} else { // 'direct'
-		slider.min = 2; slider.max = 16; slider.step = 1;
-		slider.value = MAG_RANGE;
-		if (readout) readout.textContent = MAG_RANGE;
-		if (magRangeUnit) magRangeUnit.textContent = 'cells';
-		if (magEmitAllLbl) magEmitAllLbl.hidden = true;
-		if (magDipolesLbl) magDipolesLbl.hidden = true;
+	slider.min = ui.min; slider.max = ui.max; slider.step = ui.step;
+	const v = ui.value();
+	slider.value = v;
+	if (readout) readout.textContent = ui.fmt(v);
+	if (magRangeUnit) magRangeUnit.textContent = ui.unit;
+	// `.hidden` only works on these labels because index.html carries
+	// `[hidden] { display: none !important }` — the author rule
+	// `.ctrl { display: flex }` otherwise beats the UA `[hidden]` rule and the
+	// toggles stayed visible whichever engine was selected.
+	if (magEmitAllLbl) magEmitAllLbl.hidden = !ui.emit;
+	if (magDipolesLbl) magDipolesLbl.hidden = !ui.dipoles;
+	if (magEngineNote) {
+		magEngineNote.hidden = !ui.note;
+		magEngineNote.textContent = ui.note ? '⚠ ' + ui.note : '';
+		magEngineNote.title = ui.note
+			? 'Caveat for the selected magnetic engine. See docs/magnetic-engines.md.'
+			: '';
 	}
 	magReset();
 	recompute();
 	updateStatus();
-	const tag = magEngine === 'direct'    ? 'Direct (obsolete)'
-	          : magEngine === 'hy3'        ? 'Diffusion-Hy3 (screened)'
-	          : magEngine === 'tapered'    ? 'Diffusion-Ar (tapered)'
-	          :                               'Diffusion (visual relaxation)';
-	logger('Magnetic engine: ' + tag, 'sys');
+	logger('Magnetic engine: ' + ui.tag, 'sys');
+	// 16.1 T3 — honesty about the dipole limitation. MAG_DIPOLES deliberately
+	// keeps its value (so switching back to 'hy3' restores what the user had),
+	// but under 'diffusion' it is inert: the engine injects no dipole source, so
+	// magnet↔magnet interaction silently disappears. Say so out loud instead of
+	// only hiding the toggle.
+	if (magEngine === 'diffusion' && MAG_DIPOLES) {
+		logger('Diffusion engine: dipoles are not supported — magnet↔magnet interaction is off ' +
+			'(your "Magnets inject dipoles" setting is kept and comes back under Hy3)', 'warn');
+	} else if (!ui.emf) {
+		logger(ui.tag + ': field-only — no back-EMF, so the closed-loop energy identity does not close', 'warn');
+	}
 }
 if (magEngineSel) {
 	magEngineSel.value = magEngine;

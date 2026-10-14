@@ -23,11 +23,12 @@
 //
 // Globals relied on (state.js / electric.js / maze.js): GRID_W, GRID_H, K_B,
 // MAG_LAMBDA, MAG_DIPOLES, blocked, fieldBz, fieldEdges, magnetList,
-// bodyCenter, bodyRect, bodyHat, bodyCells, edgeIsSelf, isCaseA.
+// bodyCenter, bodyRect, bodyHat, bodyCells, edgeIsSelf, isCaseA,
+// magPublishTelemetry.
 
 let magSrcHy3 = null;        // Float64Array(N): current-frame source (curl J + dipole)
-let magSrcSelfHy3 = null;    // scratch: one magnet's own dipole source
-let magBzSelfHy3 = null;     // scratch: relaxed self-field for a single magnet
+let magSrcSelfHy3 = null;    // Float64Array(N): one magnet's own dipole source
+let magBzSelfHy3 = null;     // Float64Array(N): relaxed self-field for one magnet
 const MAG_SWEEPS = 40;       // self-field convergence sweeps per magnet
 
 // Phase 1 calibration gain. The Stokes-formulated curl source on the unit
@@ -39,10 +40,27 @@ const MAG_SWEEPS = 40;       // self-field convergence sweeps per magnet
 // can go back to 1).
 const MAG_SRC_GAIN_HY3 = 20;
 
+// Lazy allocation of every Hy3 grid buffer in ONE place. They used to be
+// re-checked at each of their use sites (`!buf || buf.length !== N` in both
+// BuildSource and Publish), which read like a bug on re-reading — 17-T4.
+// Idempotent and cheap (four length checks per entry point).
+// Lifetime: allocated on first use, then never freed for the session; the grid
+// is a fixed GRID_W × GRID_H, so a buffer that already matches N is never
+// re-allocated. `fieldBz` is the shared published overlay owned by
+// electric.js — Hy3 relaxes straight into it.
+function hy3EnsureBuffers() {
+	const N = GRID_W * GRID_H;
+	if (!magSrcHy3 || magSrcHy3.length !== N) magSrcHy3 = new Float64Array(N);
+	if (!magSrcSelfHy3 || magSrcSelfHy3.length !== N) magSrcSelfHy3 = new Float64Array(N);
+	if (!magBzSelfHy3 || magBzSelfHy3.length !== N) magBzSelfHy3 = new Float64Array(N);
+	if (!fieldBz || fieldBz.length !== N) fieldBz = new Float64Array(N);
+}
+
 // Wipe the warm-started field so stale cross-engine/cross-λ state can't bleed
 // in. Called on engine switch, λ change, or dipole toggle.
 function magBzPoissonHy3Reset() {
-	if (fieldBz) fieldBz.fill(0);
+	hy3EnsureBuffers();
+	fieldBz.fill(0);
 }
 
 // Red-black Gauss–Seidel relaxation of the screened Poisson
@@ -93,7 +111,7 @@ function magRelaxInto(src, dst, sweeps) {
 // the legacy "force comes from the rails, not the bridge" convention.
 function magBzPoissonHy3BuildSource() {
 	const N = GRID_W * GRID_H, W = GRID_W, H = GRID_H;
-	if (!magSrcHy3 || magSrcHy3.length !== N) magSrcHy3 = new Float64Array(N);
+	hy3EnsureBuffers();
 	magSrcHy3.fill(0);
 
 	const mags = magnetList();
@@ -159,72 +177,45 @@ function injectDipoleSource(mag, dst, scale) {
 
 // Relax the persistent fieldBz from the current source.
 function magBzPoissonHy3Relax(sweeps) {
-	const N = GRID_W * GRID_H;
-	if (!fieldBz || fieldBz.length !== N) fieldBz = new Float64Array(N);
+	hy3EnsureBuffers();
 	magRelaxInto(magSrcHy3, fieldBz, sweeps);
 }
 
 // Sample Bz + its gradient at each magnet (finite differences on the relaxed
-// field) and write the same telemetry the legacy engine wrote, so the property
-// panel keeps working. Force F = m·∇(Bz·hat) with hat = magnet's motion axis.
-// When MAG_DIPOLES is on, each magnet's OWN dipole field is subtracted so a
-// dipole exerts no net self-force (it still feels wires and other magnets).
+// field) and write the telemetry the legacy engine wrote, so the property panel
+// keeps working. The per-magnet body lives in the SHARED magPublishTelemetry
+// (electric.js) — this function only supplies the grid sampler and, when
+// MAG_DIPOLES is on, the self-field gradient to subtract.
 function magBzPoissonHy3Publish(mags) {
-	const N = GRID_W * GRID_H, W = GRID_W, H = GRID_H;
+	const W = GRID_W, H = GRID_H;
+	hy3EnsureBuffers();
 	const bzAt = (cx, cy) => {
 		if (cx < 0 || cx >= W || cy < 0 || cy >= H) return 0;
 		return fieldBz[cy * W + cx];
 	};
+	// Self-field cancellation is only needed when magnets inject dipoles and
+	// there is at least one magnet to cancel for.
 	const needSelf = MAG_DIPOLES && mags.length > 0;
-	if (needSelf && (!magSrcSelfHy3 || magSrcSelfHy3.length !== N)) magSrcSelfHy3 = new Float64Array(N);
-	if (needSelf && (!magBzSelfHy3 || magBzSelfHy3.length !== N)) magBzSelfHy3 = new Float64Array(N);
+	magPublishTelemetry(mags, bzAt, needSelf ? { selfGrad: hy3SelfGrad } : null);
+}
 
-	for (let mi = 0; mi < mags.length; mi++) {
-		const mag = mags[mi];
-		const m = mag.magStrength != null ? mag.magStrength : 1;
-		const hat = bodyHat(mag);
-		const c = bodyCenter(mag);
-		const mcx = Math.round(c.x), mcy = Math.round(c.y);
-		let dBzdx = (bzAt(mcx + 1, mcy) - bzAt(mcx - 1, mcy)) * 0.5;
-		let dBzdy = (bzAt(mcx, mcy + 1) - bzAt(mcx, mcy - 1)) * 0.5;
-
-		if (needSelf) {
-			// Subtract this magnet's own dipole field so it doesn't self-force.
-			// Solve the self-field from a cold start with enough sweeps to
-			// converge (a point source spreads slowly), matching the converged
-			// warm-started fieldBz it is subtracted from.
-			magSrcSelfHy3.fill(0);
-			injectDipoleSource(mag, magSrcSelfHy3, K_B * MAG_SRC_GAIN_HY3); // pre-scale like magSrcHy3
-			magBzSelfHy3.fill(0);
-			magRelaxInto(magSrcSelfHy3, magBzSelfHy3, MAG_SWEEPS * 6);
-			const sbz = (cx, cy) => (cx < 0 || cx >= W || cy < 0 || cy >= H) ? 0 : magBzSelfHy3[cy * W + cx];
-			dBzdx -= (sbz(mcx + 1, mcy) - sbz(mcx - 1, mcy)) * 0.5;
-			dBzdy -= (sbz(mcx, mcy + 1) - sbz(mcx, mcy - 1)) * 0.5;
-		}
-
-		const Bz = bzAt(mcx, mcy);
-		// Dipole force: F = ∇(m·B) = m·(∂Bz/∂(hat)).
-		const F = m * (dBzdx * hat.ax + dBzdy * hat.ay);
-
-		// Per-magnet armature / peak edge current (legacy-compatible readouts).
-		let maxI = 0, bridgeI = 0;
-		for (let ei = 0; ei < fieldEdges.length; ei++) {
-			const e = fieldEdges[ei];
-			if (edgeIsSelf(e, mag)) { bridgeI = e.I; continue; }
-			if (Math.abs(e.I) > Math.abs(maxI)) maxI = e.I;
-		}
-		// Motional EMF of the magnet's own motion through the local field
-		// gradient (same physics as the legacy Eb = −m·K_B·∂G/∂hat·v).
-		const dBzdh = dBzdx * hat.ax + dBzdy * hat.ay;
-		const Eb = -m * dBzdh * (mag.vel || 0);
-		const lastCurrent = isCaseA(mag) ? bridgeI : maxI;
-		const elecP = Eb * lastCurrent;
-		mag.lastBz = Bz;
-		mag.lastFcoil = F;
-		mag.lastPower = elecP;
-		mag.lastCurrent = lastCurrent;
-		mag.lastEMF = lastCurrent ? elecP / lastCurrent : 0;
-		const eta = mag.efficiency != null ? mag.efficiency : 0.85;
-		mag.lastHeat = Math.abs(elecP) * Math.max(0, 1 - eta);
-	}
+// One magnet's own dipole field, as a gradient to SUBTRACT from the sampled
+// total: a dipole represented as two point sources has a non-zero on-axis
+// gradient at its own centre, so without this a magnet would spuriously feel
+// its own field. Solved from a cold start with enough sweeps to converge (a
+// point source spreads slowly), matching the converged warm-started fieldBz it
+// is subtracted from. The B-field VIEW (fieldBz) keeps the full field including
+// every magnet's own contribution — only the force sampling cancels it.
+function hy3SelfGrad(mag, mcx, mcy) {
+	const W = GRID_W, H = GRID_H;
+	hy3EnsureBuffers();
+	magSrcSelfHy3.fill(0);
+	injectDipoleSource(mag, magSrcSelfHy3, K_B * MAG_SRC_GAIN_HY3); // pre-scale like magSrcHy3
+	magBzSelfHy3.fill(0);
+	magRelaxInto(magSrcSelfHy3, magBzSelfHy3, MAG_SWEEPS * 6);
+	const sbz = (cx, cy) => (cx < 0 || cx >= W || cy < 0 || cy >= H) ? 0 : magBzSelfHy3[cy * W + cx];
+	return {
+		dx: (sbz(mcx + 1, mcy) - sbz(mcx - 1, mcy)) * 0.5,
+		dy: (sbz(mcx, mcy + 1) - sbz(mcx, mcy - 1)) * 0.5
+	};
 }

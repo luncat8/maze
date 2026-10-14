@@ -129,6 +129,13 @@
 
 		.color-group { display: flex; gap: 8px; align-items: center; }
 		.ctrl { display: flex; align-items: center; gap: 8px; font-size: 12px; cursor: pointer; }
+		/* Author rules beat the UA `[hidden] { display: none }` rule in the
+		   cascade, so `.ctrl { display: flex }` above silently defeated the
+		   `hidden` property that js/ui.js uses to show/hide the per-engine
+		   magnetic toggles. Without !important those labels ignored `hidden`
+		   entirely. */
+		[hidden] { display: none !important; }
+		#magEngineNote { color: #fbbf24; font-size: 11px; cursor: help; }
 		canvas { background: #ddd; border: 3px solid #444; cursor: crosshair; image-rendering: pixelated; display: block; box-sizing: border-box; width: 100%; height: 100%; object-fit: contain; touch-action: none; }
 		.path-entry { display: flex; align-items: center; gap: 8px; padding: 2px 0; }
 		.path-swatch { width: 12px; height: 12px; border-radius: 50%; border: 1px solid #fff; flex: none; }
@@ -136,6 +143,7 @@
 		.log-entry { border-bottom: 1px solid #222; padding: 2px 0; }
 		.log-entry.sys { color: #0f0; }
 		.log-entry.err { color: #f55; }
+		.log-entry.warn { color: #fbbf24; }
 		</style>
 </head>
 <body>
@@ -193,7 +201,7 @@
 					<option value="circuit">Circuit (nodal, obsolete)</option>
 				</select>
 			</label>
-			<label class="ctrl" title="Four magnetic engines. 'tapered' (was 'ar'): Bz diffusion from a windowed Biot–Savart source, warm-started, smooth, with back-EMF. 'diffusion' (default): explicit forward-Euler cell-to-cell relaxation, field-only (no back-EMF), visibly spreads between cells. 'hy3': screened-Poisson (∇²−λ²)Bz=S, separate lambda-tunable decay, field-only. 'direct': legacy per-frame Biot–Savart sum with hard MAG_RMAX cutoff (obsolete, regression only).">Magnetics:
+			<label class="ctrl" title="Four magnetic engines. 'tapered' (was 'ar'): Bz diffusion from a windowed Biot–Savart source, warm-started, smooth, with back-EMF. 'diffusion' (default): explicit forward-Euler cell-to-cell relaxation, field-only (no back-EMF), no dipole support, visibly spreads between cells. 'hy3': screened-Poisson (∇²−λ²)Bz=S, separate lambda-tunable decay, field-only. 'direct': legacy per-frame Biot–Savart sum with hard MAG_RMAX cutoff (obsolete, regression only).">Magnetics:
 				<select id="magEngineSel">
 					<option value="tapered">Diffusion-Ar (tapered)</option>
 					<option value="diffusion" selected>Diffusion (visual relaxation)</option>
@@ -201,16 +209,17 @@
 					<option value="direct">Direct (obsolete)</option>
 				</select>
 			</label>
-			<label class="ctrl" id="magRangeLbl" title="Engine-specific control bound to the same slider. 'tapered': radius of the diffused field in cells (the kernel tapers smoothly to zero here; no hard cutoff jump). Larger = longer reach (16 ≈ whole grid). 'hy3': the screened-Poisson decay λ (smaller λ = longer decay length). 'diffusion': the per-step forward-Euler rate α (CFL requires 4·α < 1; higher α spreads the field faster per iteration).">B range:
+			<label class="ctrl" id="magRangeLbl" title="Engine-specific control bound to the same slider. 'tapered': radius of the diffused field in cells (the kernel tapers smoothly to zero here; no hard cutoff jump). Larger = longer reach (16 ≈ whole grid). 'hy3': the screened-Poisson decay λ (smaller λ = longer decay length). 'diffusion': the per-step forward-Euler rate α, capped at 0.24 because CFL needs 4·α ≤ 1 and 0.25 is exactly marginal (a neutrally-stable checkerboard). α is a SPEED knob only — it sets how fast the field spreads, not how strong it settles.">B range:
 				<input type="range" id="magRange" min="2" max="16" step="1" value="8">
 				<span id="magRangeVal">8</span> <span id="magRangeUnit">cells</span>
 			</label>
-			<label class="ctrl" id="magEmitAllLbl" title="Let every magnet also emit its own dipole field (⊙/⊗), so magnets push on each other and the B-field view shows their dipoles. Per-item override: the Emit B checkbox on a magnet piston. Tapered engine only.">
+			<label class="ctrl" id="magEmitAllLbl" hidden title="Let every magnet also emit its own dipole field (⊙/⊗), so magnets push on each other and the B-field view shows their dipoles. Per-item override: the Emit B checkbox on a magnet piston. Tapered engine only.">
 				<input type="checkbox" id="magEmitAll"> Magnets emit B
 			</label>
-			<label class="ctrl" id="magDipolesLbl" style="display:none" title="Hy3 engine only: let every magnet inject its own dipole into the screened-Poisson source so magnets push on each other (self-field cancellation keeps a dipole from feeling itself).">
+			<label class="ctrl" id="magDipolesLbl" hidden title="Hy3 engine only: let every magnet inject its own dipole into the screened-Poisson source so magnets push on each other (self-field cancellation keeps a dipole from feeling itself).">
 				<input type="checkbox" id="magDipoles"> Magnets inject dipoles
 			</label>
+			<span class="ctrl" id="magEngineNote" hidden></span>
 			<label class="ctrl">Metal R:
 				<input type="range" id="metalR" min="1" max="200" step="1" value="20">
 				<span id="metalRVal">20</span> Ω

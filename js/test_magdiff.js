@@ -3,7 +3,8 @@
 //   'diffusion'— explicit forward-Euler cell-to-cell diffusion (default)
 //   'hy3'      — Hy3 screened-Poisson (js/magBzPoissonHy3.js)
 //   'direct'   — legacy per-frame Biot–Savart (obsolete, regression only)
-// See .kilo/plans/1788383164355-add-diffusion-engine.md.
+// See 16.1-plan-add-diffusion-engine.md (engine + 11a/11b/11c) and 17-plan.md
+// (11d, 17-T2, 17-T4, 17-T5).
 // Run: node js/test_magdiff.js
 
 const fs = require('fs');
@@ -163,7 +164,7 @@ runCode(`
 		if (rel > maxRel) { maxRel = rel; worst = [x, y, d, a]; }
 	}
 	globalThis.__acc = { maxRel: maxRel, worst: worst, peak: peak, lastBz: m.lastBz, refBz: ref.w,
-		lastDv: magLastDv, srcCells: magSrcCells };
+		lastDBz: magLastDBz, srcCells: magSrcCells };
 `);
 const acc = sandbox.__acc;
 assert(acc.maxRel < 0.05, `relaxed Bz matches the windowed analytic kernel within 5 % (worst ${(acc.maxRel * 100).toFixed(2)} % at cell ${acc.worst && acc.worst.slice(0, 2)})`);
@@ -175,14 +176,14 @@ console.log(`   source support: ${acc.srcCells} of ${GRID_W * GRID_H} cells (sca
 console.log('\n== 3. Persistent field state (warm start) ==');
 // 3a. The field is warm-started from the previous frame's state: after the
 // circuit is changed, one frame moves the field only PART of the way to the new
-// steady state (magLastDv > 0), and successive frames converge it. The legacy
+// steady state (magLastDBz > 0), and successive frames converge it. The legacy
 // engine has no such state — it is recomputed from scratch every frame.
 runCode(`
 	globalThis.__b0 = fieldBz[15 * GRID_W + 15];
 	// halve the drive: the V field relaxes toward a new steady state
 	for (const b of manualBatteries) b.term[1] = b.term[0];
 	globalThis.__dv = [];
-	for (var s = 0; s < 12; s++) { fieldSimulate(); fieldRelax(50); fieldPublish(); globalThis.__dv.push(magLastDv); }
+	for (var s = 0; s < 12; s++) { fieldSimulate(); fieldRelax(50); fieldPublish(); globalThis.__dv.push(magLastDBz); }
 	globalThis.__b1 = fieldBz[15 * GRID_W + 15];
 `);
 const warm = { b0: sandbox.__b0, b1: sandbox.__b1, dv: sandbox.__dv };
@@ -497,8 +498,227 @@ assert(Number.isFinite(hy3c.F),
 assert(getRef('magEngine') === 'tapered',
 	`magEngine round-trips to 'tapered' (got ${getRef('magEngine')})`);
 
-// ---- 11. why the force is NOT read off the relaxed grid ----------------
-console.log('\n== 11. Grid owns values, analytic kernel owns derivatives ==');
+// ---- 11. diffusion engine: transient, α-decoupled amplitude, wiring ------
+console.log('\n== 11. Diffusion engine (forward-Euler transient) ==');
+// Four checks on the DEFAULT engine, 'diffusion' (js/magfield_diffusion.js).
+//
+// Why 11a varies the SWEEP BUDGET and not α: the old smoke test for this engine
+// quoted "peak 23.09 at α=0.05 vs 5.78 at α=0.20, ratio 3.994 ≈ 4" as proof of
+// true cell-to-cell diffusion. It proved nothing — 4 is exactly 0.20/0.05, and
+// the settled amplitude of the pre-16.1 update `Bz += α·∇²Bz + S` scales as
+// 1/α, so an instant Poisson solve reproduces those two peaks bit for bit
+// (15.5-review §A). The sweep budget is the only variable a steady-state solver
+// cannot respond to, so that is what 11a varies.
+//
+// Protocol note (both matter, both were measured):
+//   * `e.I` is written by fieldPublish, and the ELECTRIC solve is itself a
+//     relaxation, so the circuit must be converged before the Bz transient is
+//     measured. On this scene a 500-sweep Bz budget reports peak |Bz| = 175
+//     after 1 settle frame, 23.86 after 20, 23.08 after 40 — an unconverged
+//     circuit looks like a STRONGER field, not a weaker one.
+//   * the magnet is pinned every frame, so all budgets and both α values see an
+//     identical source (same reason test 8 pins it).
+
+// Converge the circuit with the magnet pinned at (20,15).
+function diffusionSettle(frames) {
+	runCode(`
+		for (var s = 0; s < ${frames}; s++) {
+			pistons[0].pos = 20; pistons[0].x = 20; pistons[0].vel = 0;
+			fieldSimulate(); fieldRelax(50); fieldPublish();
+			pistons[0].pos = 20; pistons[0].x = 20; pistons[0].vel = 0;
+		}
+	`);
+}
+// Cold-start the engine's own buffers, advance them by exactly `sweeps`, publish.
+// The sweep budget is the only variable; MAG_DIFFUSION_ALPHA is read live.
+function peakAt(sweeps) {
+	runCode(`
+		pistons[0].pos = 20; pistons[0].x = 20; pistons[0].vel = 0;
+		magDiffusionReset(); magDiffusionBuildSource();
+		magDiffusionRelax(${sweeps});
+		magDiffusionPublish(pistons);
+		var mx = 0, best = 0;
+		for (var i = 0; i < fieldBz.length; i++) {
+			var v = Math.abs(fieldBz[i]);
+			if (v > mx) { mx = v; best = fieldBz[i]; }
+		}
+		globalThis.__pk = { peak: mx, signed: best, F: pistons[0].lastFcoil };
+	`);
+	return sandbox.__pk;
+}
+
+// 11a — transient discrimination: fixed α, growing sweep budget. A steady-state
+// solver returns the same peak for every budget; only a genuinely transient
+// engine grows toward its asymptote. Measured at α=0.20 on this scene:
+// 5 → 21.488, 50 → 22.941, 500 → 23.084, 2000 → 23.0956 (asymptote).
+clearBoard();
+railScene({ magX: 20 });
+runCode(`magEngine = 'diffusion'; MAG_DIFFUSION_ALPHA = 0.20; magReset(); fieldSimulate();`);
+diffusionSettle(40);
+const p5 = peakAt(5), p50 = peakAt(50), p500 = peakAt(500), p2000 = peakAt(2000);
+console.log(`   peak |Bz| vs sweep budget (α=0.20): 5 → ${p5.peak.toFixed(4)}, 50 → ${p50.peak.toFixed(4)}, 500 → ${p500.peak.toFixed(4)}, 2000 → ${p2000.peak.toFixed(4)}`);
+assert(p5.peak < p50.peak && p50.peak < p500.peak,
+	`the field GROWS with the sweep budget at fixed α — transient, not an instant solve (${p5.peak.toFixed(3)} < ${p50.peak.toFixed(3)} < ${p500.peak.toFixed(3)})`);
+assert(p50.peak - p5.peak > 1e-3 && p500.peak - p50.peak > 1e-3,
+	`...by more than tolerance, not by rounding (gaps ${(p50.peak - p5.peak).toFixed(4)} and ${(p500.peak - p50.peak).toFixed(4)})`);
+assert(p500.peak / p50.peak < 2,
+	`...and it is settling, not diverging (peak(500)/peak(50) = ${(p500.peak / p50.peak).toFixed(4)} < 2)`);
+assert(p2000.peak / p500.peak < 1.01,
+	`...onto an asymptote: 4× the budget buys < 1 % more (measured ${(100 * (p2000.peak / p500.peak - 1)).toFixed(3)} %)`);
+
+// 11b — T1's contract: α is a SPEED knob only. With the source folded inside
+// the α bracket the settled state is ∇²Bz = S₀ with S₀ α-independent, so two α
+// values given enough sweeps must land on the same amplitude; given too few
+// sweeps the lower α must lag. Measured: settled(500) 23.039 (α=0.05) vs 23.084
+// (α=0.20) — 0.20 % apart; transient(5) 14.341 vs 21.488 — α-dependent.
+runCode(`MAG_DIFFUSION_ALPHA = 0.05;`);
+const loSettled = peakAt(500).peak, loTransient = peakAt(5).peak;
+runCode(`MAG_DIFFUSION_ALPHA = 0.20;`);
+const hiSettled = peakAt(500).peak, hiTransient = peakAt(5).peak;
+const settledRel = Math.abs(loSettled - hiSettled) / hiSettled;
+console.log(`   settled (500 sweeps): α=0.05 → ${loSettled.toFixed(4)}, α=0.20 → ${hiSettled.toFixed(4)} (${(100 * settledRel).toFixed(3)} % apart)`);
+console.log(`   transient (5 sweeps): α=0.05 → ${loTransient.toFixed(4)}, α=0.20 → ${hiTransient.toFixed(4)}`);
+assert(settledRel < 0.10,
+	`the SETTLED amplitude is α-independent (the old formulation scaled it as 1/α — a 4× force swing across two slider stops): ${(100 * settledRel).toFixed(3)} % apart < 10 %`);
+assert(loTransient < hiTransient,
+	`...while the TRANSIENT is α-dependent — lower α builds more slowly (${loTransient.toFixed(3)} < ${hiTransient.toFixed(3)} at 5 sweeps)`);
+runCode(`MAG_DIFFUSION_ALPHA = 0.20;`);
+
+// 11c — cross-engine round-trip on the rail scene. The magnet sits at (12,14),
+// NOT at the centred (15,15)/(20,15) cells: between two opposite-current rails
+// the analytic gradient is a small residue of large cancelling terms and a
+// 1-cell grid gradient gets its SIGN wrong — that is exactly what test 12
+// measures, and it is why the sign contract is asserted here (off-centre,
+// non-degenerate) rather than at the centred placement. Measured at (12,14):
+// tapered −2.44e-1, hy3 −1.00e-1, diffusion −1.21e-1 — all three agree.
+clearBoard();
+railScene({ magX: 12, magY: 14 });
+runCode(`
+	function pinned(frames) {
+		for (var s = 0; s < frames; s++) {
+			pistons[0].pos = 12; pistons[0].x = 12; pistons[0].vel = 0;
+			fieldSimulate(); fieldRelax(50); fieldPublish();
+			pistons[0].pos = 12; pistons[0].x = 12; pistons[0].vel = 0;
+		}
+	}
+	magEngine = 'diffusion'; MAG_DIFFUSION_ALPHA = 0.20; magReset(); fieldSimulate();
+	pinned(40);
+	globalThis.__rtDiff = { F: pistons[0].lastFcoil, Bz: pistons[0].lastBz };
+	magEngine = 'tapered'; magReset(); fieldSimulate();
+	pinned(40);
+	globalThis.__rtTap = { F: pistons[0].lastFcoil, Bz: pistons[0].lastBz };
+`);
+const rtDiff = sandbox.__rtDiff, rtTap = sandbox.__rtTap;
+console.log(`   rail scene, magnet at (12,14): diffusion F=${rtDiff.F.toExponential(3)}, tapered F=${rtTap.F.toExponential(3)}`);
+assert(Number.isFinite(rtDiff.F) && rtDiff.F !== 0,
+	`'diffusion' produces a finite non-zero force on the rail magnet (F=${rtDiff.F.toExponential(3)})`);
+assert(Math.sign(rtDiff.F) === Math.sign(rtTap.F),
+	`...with the same SIGN as 'tapered' (diffusion ${rtDiff.F.toExponential(3)}, tapered ${rtTap.F.toExponential(3)}) — the source sign convention matches Hy3's Poisson at λ=0`);
+assert(Number.isFinite(rtTap.F) && Number.isFinite(rtTap.Bz),
+	`round-tripping to 'tapered' leaves finite telemetry, so the diffusion buffers don't leak (F=${rtTap.F.toExponential(3)}, Bz=${rtTap.Bz.toFixed(3)})`);
+assert(getRef('magEngine') === 'tapered',
+	`magEngine round-trips to 'tapered' (got ${getRef('magEngine')})`);
+
+// 11d — K_B slider wiring (17-T3). The #kbGain handler must re-solve the field
+// under 'diffusion' on BOTH arms: `if (magnetList().length)` (a magnet needs
+// force/EMF telemetry) and the `else if (electricActive())
+// scheduleFieldRecompute()` arm 15.5 #3 added (a live circuit with no magnet
+// still has to refresh the B-field view). Driven through the REAL ui.js handler,
+// with setTimeout captured so the 60 ms debounce fires synchronously and can be
+// asserted on rather than waited for.
+function captureTimers() {
+	runCode(`
+		globalThis.__sched = [];
+		globalThis.__st = setTimeout; globalThis.__ct = clearTimeout;
+		setTimeout = function (fn, ms) { globalThis.__sched.push(ms); fn(); return 1; };
+		clearTimeout = function () {};
+	`);
+}
+function releaseTimers() {
+	runCode(`setTimeout = globalThis.__st; clearTimeout = globalThis.__ct;`);
+}
+function dragKB(v) {
+	runCode(`var s = document.getElementById('kbGain'); s.value = '${v}'; s.oninput();`);
+	return getRef('globalThis.__sched.slice()');
+}
+
+// (a) with a magnet: force is linear in K_B (no back-EMF under 'diffusion', so
+// the circuit doesn't move when K_B does) and returns when dragged back.
+clearBoard();
+railScene({ magX: 12, magY: 14 });
+runCode(`
+	magEngine = 'diffusion'; MAG_DIFFUSION_ALPHA = 0.20; K_B = 1; magReset(); fieldSimulate();
+	for (var s = 0; s < 40; s++) { fieldSimulate(); fieldRelax(50); fieldPublish(); }
+	globalThis.__kb1 = pistons[0].lastFcoil;
+`);
+captureTimers();
+const schedMag = dragKB(2);
+releaseTimers();
+runCode(`
+	for (var s = 0; s < 40; s++) { fieldSimulate(); fieldRelax(50); fieldPublish(); }
+	globalThis.__kb2 = pistons[0].lastFcoil;
+`);
+captureTimers();
+const schedBack = dragKB(1);
+releaseTimers();
+runCode(`
+	for (var s = 0; s < 40; s++) { fieldSimulate(); fieldRelax(50); fieldPublish(); }
+	globalThis.__kb1b = pistons[0].lastFcoil; K_B = 40; magReset();
+`);
+const kb1 = getRef('globalThis.__kb1'), kb2 = getRef('globalThis.__kb2'), kb1b = getRef('globalThis.__kb1b');
+console.log(`   K_B drag with a magnet: F(1)=${kb1.toExponential(3)} → F(2)=${kb2.toExponential(3)} → F(1)=${kb1b.toExponential(3)} (ratios ${(kb2 / kb1).toFixed(5)}, ${(kb1b / kb2).toFixed(5)})`);
+assert(schedMag.length === 0 && schedBack.length === 0,
+	`with a magnet the handler takes the immediate arm (fieldSimulate + startSimLoop), not the deferred recompute (scheduled: [${schedMag}], [${schedBack}])`);
+assert(Math.abs(kb2 / kb1 - 2) < 0.05,
+	`K_B 1 → 2 doubles the force under 'diffusion' (ratio ${(kb2 / kb1).toFixed(5)}, within 5 %)`);
+assert(Math.abs(kb1b / kb1 - 1) < 0.05,
+	`...and dragging back to 1 restores it (ratio ${(kb1b / kb1).toFixed(5)})`);
+
+// (b) with NO magnet: the deferred arm must fire and the B-field overlay must
+// still re-solve. colorView = 'bfield' is what makes the magnetic advance run
+// at all without a magnet (the dispatch is gated on
+// `mags.length || colorView === 'bfield'`).
+clearBoard();
+runCode(`
+	INV.battery.count = 10; unlimited = false;
+	for (let y = 12; y <= 18; y++) for (let x = 4; x <= 26; x++) grid[y * GRID_W + x] = 0;
+	buildNetworks(); seedAir();
+	var rc = (x, y) => y * GRID_W + x;
+	var top = [], bot = [];
+	for (let x = 6; x <= 24; x++) { top.push(rc(x, 13)); bot.push(rc(x, 17)); }
+	sceneAddWire(top, '#22c55e');
+	sceneAddWire(bot.slice().reverse(), '#22c55e');
+	sceneAddWire([rc(6,14), rc(6,15), rc(6,16)], '#22c55e');
+	sceneAddWire([rc(24,14), rc(24,15), rc(24,16)], '#22c55e');
+	placeBattery(6, 13);
+	colorView = 'bfield'; magEngine = 'diffusion'; MAG_DIFFUSION_ALPHA = 0.20; K_B = 1;
+	magReset(); fieldSimulate();
+	for (var s = 0; s < 40; s++) { fieldSimulate(); fieldRelax(50); fieldPublish(); }
+	globalThis.peakBz = function () { var mx = 0; for (var i = 0; i < fieldBz.length; i++) mx = Math.max(mx, Math.abs(fieldBz[i])); return mx; };
+	globalThis.__nm1 = globalThis.peakBz();
+`);
+captureTimers();
+const schedNoMag = dragKB(2);
+releaseTimers();
+runCode(`
+	for (var s = 0; s < 40; s++) { fieldSimulate(); fieldRelax(50); fieldPublish(); }
+	globalThis.__nm2 = globalThis.peakBz();
+	globalThis.__nmMags = magnetList().length;
+	colorView = 'net'; K_B = 40; magReset();
+	// leave the panel and the sandbox as we found them
+	document.getElementById('kbGain').value = '40';
+	delete globalThis.peakBz;
+`);
+const nm1 = getRef('globalThis.__nm1'), nm2 = getRef('globalThis.__nm2'), nmMags = getRef('globalThis.__nmMags');
+console.log(`   K_B drag with no magnet (magnets=${nmMags}): deferred recompute scheduled at ${JSON.stringify(schedNoMag)} ms, peak |Bz| ${nm1.toFixed(4)} → ${nm2.toFixed(4)} (ratio ${(nm2 / nm1).toFixed(5)})`);
+assert(nmMags === 0, `the no-magnet scene really has no magnet (magnetList().length = ${nmMags})`);
+assert(schedNoMag.length === 1 && schedNoMag[0] === 60,
+	`with no magnet the handler takes the deferred arm 15.5 #3 added — scheduleFieldRecompute() ran (setTimeout captured: ${JSON.stringify(schedNoMag)} ms)`);
+assert(Math.abs(nm2 / nm1 - 2) < 0.05,
+	`...and the field really re-solves without a magnet: K_B 1 → 2 doubles the B-field overlay (ratio ${(nm2 / nm1).toFixed(5)})`);
+
+// ---- 12. why the force is NOT read off the relaxed grid ----------------
+console.log('\n== 12. Grid owns values, analytic kernel owns derivatives ==');
 // The relaxed grid reproduces the analytic field VALUES closely, but a 1-cell
 // gradient of it does not reproduce the analytic GRADIENT in a near-symmetric
 // geometry, where the true gradient is a small residue of large cancelling

@@ -5,18 +5,41 @@
 // started), this engine advances a *transient* heat-equation update each
 // frame:
 //
-//     Bz ← Bz + α · (Bx⁺ + Bx⁻ + By⁺ + By⁻ − 4·Bz) + S
+//     Bz ← Bz + α · (Bx⁺ + Bx⁻ + By⁺ + By⁻ − 4·Bz − S)
 //
-// where S is the discrete curl of the edge currents (same sign convention
-// as Hy3's magBzPoissonHy3BuildSource, so magnet telemetry lastFcoil keeps
-// the same sign across engine switches). α is user-tunable via
-// MAG_DIFFUSION_ALPHA (slider range [0.02, 0.24]; CFL stability requires
-// 4·α ≤ 1, and α=0.25 is exactly marginal — the amplification factor at
-// the Nyquist mode is g = 1−8α = −1, a neutrally-stable checkerboard
-// that never damps. The slider cap of 0.24 gives g = −0.92). The field
-// actually spreads cell-to-cell over successive iterations: higher α
-// diffuses current to neighbours faster per sweep, so the peak decays
-// faster. No back-EMF injection in this plan.
+// i.e. ∂Bz/∂t = α·(∇²Bz − S), whose settled state is the Poisson problem
+//
+//     ∇²Bz = S,     S = K_B · MAG_SRC_GAIN_DIFF · curl J
+//
+// — the *same* equation and the *same* source sign convention as Hy3's
+// screened Poisson (∇²−λ²)Bz = S at λ=0, so `fieldBz` (and with it
+// `m.lastFcoil`) keeps its sign when the engine is switched. S is the
+// discrete curl of the edge currents, built by magDiffusionBuildSource
+// exactly like magBzPoissonHy3BuildSource.
+//
+// Because the source sits INSIDE the α bracket, α is a pure speed knob: it
+// sets the relaxation time constant (≈ 1/α sweeps) and nothing else. The
+// settled amplitude is α-independent (test_magdiff.js 11b). Earlier the
+// source was added outside the bracket, which made the settled peak scale as
+// 1/α — a ~12× force swing across the slider range.
+//
+// α is user-tunable via MAG_DIFFUSION_ALPHA (slider range [0.02, 0.24]; CFL
+// stability requires 4·α ≤ 1, and α=0.25 is exactly marginal — the
+// amplification factor at the Nyquist mode is g = 1−8α = −1, a neutrally-
+// stable checkerboard that never damps. The slider cap of 0.24 gives
+// g = −0.92). The field actually spreads cell-to-cell over successive
+// iterations: with a fixed sweep budget, higher α settles closer to the
+// asymptote, lower α is still visibly mid-transient (test_magdiff.js 11a).
+// No back-EMF injection in this plan.
+//
+// LIMITATION (16.1 T3): this engine has NO dipole support. It injects only the
+// curl-of-J wire source, so with MAG_DIPOLES on, switching to 'diffusion'
+// silently drops the magnet↔magnet interaction that 'hy3' provides. The UI
+// therefore hides the #magDipoles toggle under 'diffusion' AND logs a hint when
+// the engine is selected (js/ui.js magEngineOnChange), rather than leaving the
+// toggle visible but inert. A dipole injector here needs the same self-field
+// cancellation machinery Hy3 carries (per-magnet cold-start self solve), which
+// is recorded as Phase-2 scope in 16.1-plan-add-diffusion-engine.md.
 //
 // Boundary treatment: cells on the grid edge and `blocked` cells are
 // pinned to zero, and blocked neighbours contribute 0 to the sum. This
@@ -28,8 +51,9 @@
 // near walls.
 //
 // Globals relied on (state.js / electric.js / maze.js): GRID_W, GRID_H,
-// K_B, MAG_DIFFUSION_ALPHA, blocked, fieldBz, fieldEdges, magnetList,
-// bodyCenter, bodyRect, bodyHat, bodyCells, edgeIsSelf, isCaseA.
+// K_B, MAG_DIFFUSION_ALPHA, MAG_SRC_GAIN_DIFF, blocked, fieldBz, fieldEdges,
+// magnetList, bodyCenter, bodyRect, bodyHat, bodyCells, edgeIsSelf, isCaseA,
+// magPublishTelemetry.
 
 let fieldBzDiff = null;        // Float64Array(N): the engine's Bz
 let fieldBzDiffScratch = null; // Float64Array(N): swap buffer for the Euler step
@@ -70,7 +94,7 @@ function magDiffusionBuildSource() {
 		magSrcDiff[by * W + bx] -= I;
 	}
 
-	for (let i = 0; i < N; i++) magSrcDiff[i] *= K_B;
+	for (let i = 0; i < N; i++) magSrcDiff[i] *= K_B * MAG_SRC_GAIN_DIFF;
 }
 
 function magDiffusionRelax(sweeps) {
@@ -95,7 +119,18 @@ function magDiffusionRelax(sweeps) {
 			if (!blocked[i + 1]) sum += fieldBzDiff[i + 1];
 			if (!blocked[i - W]) sum += fieldBzDiff[i - W];
 			if (!blocked[i + W]) sum += fieldBzDiff[i + W];
-			const nv = bz + alpha * (sum - 4 * bz) + magSrcDiff[i];
+			// Source folded INSIDE the α bracket — this is the `dt` separation:
+			//   ∂Bz/∂t = α·(∇²Bz − S₀)
+			// so the per-step source increment is α·S₀ and the settled state is
+			//   ∇²Bz = S₀,  S₀ = K_B·MAG_SRC_GAIN_DIFF·curl J
+			// i.e. α controls ONLY the relaxation time constant, never the
+			// settled amplitude. (The previous form `+ S₀` outside the bracket
+			// made α do double duty: settled peak ∝ K_B/α, a ~12× force swing
+			// across the 0.02–0.24 slider.) The settled equation is also now
+			// the same Poisson sign convention Hy3 solves — (∇²−λ²)Bz = S at
+			// λ=0 — so fieldBz, and with it m.lastFcoil, keeps its sign when
+			// the engine is switched. See test_magdiff.js 11a/11b/11c.
+			const nv = bz + alpha * (sum - 4 * bz - magSrcDiff[i]);
 			fieldBzDiffScratch[i] = isFinite(nv) ? nv : 0;
 		}
 		const tmp = fieldBzDiff;
@@ -104,6 +139,12 @@ function magDiffusionRelax(sweeps) {
 	}
 }
 
+// Copy the engine's private Bz into the shared published overlay, then hand the
+// per-magnet telemetry to the SHARED magPublishTelemetry (electric.js) — this
+// used to be a verbatim copy of magBzPoissonHy3Publish's body (16.1 finding F).
+// No `selfGrad` is passed: 'diffusion' injects no dipole source, so there is no
+// self-field to cancel — which is also why dipoles are unsupported here (the UI
+// says so; see magEngineOnChange in js/ui.js and docs/magnetic-engines.md).
 function magDiffusionPublish(mags) {
 	const N = GRID_W * GRID_H, W = GRID_W, H = GRID_H;
 	if (!fieldBz || fieldBz.length !== N) fieldBz = new Float64Array(N);
@@ -114,32 +155,5 @@ function magDiffusionPublish(mags) {
 		return fieldBz[cy * W + cx];
 	};
 
-	for (let mi = 0; mi < mags.length; mi++) {
-		const mag = mags[mi];
-		const m = mag.magStrength != null ? mag.magStrength : 1;
-		const hat = bodyHat(mag);
-		const c = bodyCenter(mag);
-		const mcx = Math.round(c.x), mcy = Math.round(c.y);
-		const dBzdx = (bzAt(mcx + 1, mcy) - bzAt(mcx - 1, mcy)) * 0.5;
-		const dBzdy = (bzAt(mcx, mcy + 1) - bzAt(mcx, mcy - 1)) * 0.5;
-		const Bz = bzAt(mcx, mcy);
-		const F = m * (dBzdx * hat.ax + dBzdy * hat.ay);
-		let maxI = 0, bridgeI = 0;
-		for (let ei = 0; ei < fieldEdges.length; ei++) {
-			const e = fieldEdges[ei];
-			if (edgeIsSelf(e, mag)) { bridgeI = e.I; continue; }
-			if (Math.abs(e.I) > Math.abs(maxI)) maxI = e.I;
-		}
-		const dBzdh = dBzdx * hat.ax + dBzdy * hat.ay;
-		const Eb = -m * dBzdh * (mag.vel || 0);
-		const lastCurrent = isCaseA(mag) ? bridgeI : maxI;
-		const elecP = Eb * lastCurrent;
-		mag.lastBz = Bz;
-		mag.lastFcoil = F;
-		mag.lastPower = elecP;
-		mag.lastCurrent = lastCurrent;
-		mag.lastEMF = lastCurrent ? elecP / lastCurrent : 0;
-		const eta = mag.efficiency != null ? mag.efficiency : 0.85;
-		mag.lastHeat = Math.abs(elecP) * Math.max(0, 1 - eta);
-	}
+	magPublishTelemetry(mags, bzAt, null);
 }

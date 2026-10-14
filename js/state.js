@@ -168,11 +168,15 @@ const MAG_RMAX = 8;     // kernel cutoff (cells) — LEGACY ('direct') engine on
 //    the relaxed field IS that analytic field, smoothly tapered instead of
 //    hard-cut. Warm-started, O(cells) per sweep, no cutoff discontinuity.
 //  'diffusion' (default) — Explicit forward-Euler cell-to-cell diffusion.
-//    Bz ← Bz + α·(sum of 4 neighbors − 4·Bz) + S, run for MAG_SWEEPS_PER_FRAME
-//    iterations per frame. Source S is the discrete curl of the edge
-//    currents, computed in-file from fieldEdges. The field actually spreads
-//    between cells frame-by-frame; higher α ⇒ faster spread, lower peak.
-//    No back-EMF injection in this plan.
+//    Bz ← Bz + α·(sum of 4 neighbors − 4·Bz − S), run for
+//    FIELD_SWEEPS_PER_FRAME iterations per frame, so the settled state is the
+//    Poisson problem ∇²Bz = S — the same equation and source sign convention
+//    as 'hy3' at λ=0. S = K_B·MAG_SRC_GAIN_DIFF·(discrete curl of the edge
+//    currents), computed in-file from fieldEdges. The field actually spreads
+//    between cells frame-by-frame: α is a pure SPEED knob (it sets the
+//    relaxation time constant only), so with a fixed sweep budget higher α
+//    settles closer to the asymptote while lower α stays visibly mid-transient.
+//    No dipole support, no back-EMF injection in this plan.
 //  'hy3' — Hy3 screened-Poisson (separate file: js/magBzPoissonHy3.js).
 //    Solves (∇² − λ²) Bz = S for the curl of J + (when MAG_DIPOLES) each
 //    magnet's own dipole. Range is λ (1/λ = decay length), no hard cutoff.
@@ -188,7 +192,10 @@ let magEngine = 'diffusion';
 // near-field terms, so it flips sign below ~7 cells — hence the default keeps
 // the legacy 8-cell radius and lets the taper do the shortening (w(6) ≈ 0.19).
 let MAG_RANGE = 8;
-const MAG_SWEEPS_PER_FRAME = 50;      // magnetic-field (Bz) relaxation steps per frame;
+// NOTE: the per-frame relaxation budget lives in js/electric.js as
+// FIELD_SWEEPS_PER_FRAME (50) and is shared by the electric-potential solve
+// (fieldRelax) and the magnetic Bz advance of every engine. It used to be
+// declared here as MAG_SWEEPS_PER_FRAME — two names, one budget (17-T5).
 let magEmitAll = false;               // master switch: every magnet emits its dipole field
 const MAG_EMIT_R = 3;                 // dipole source window (cells) around a body
 
@@ -200,7 +207,55 @@ let MAG_DIPOLES = false;              // 'hy3': magnets also inject their own di
 // (the new visual-relaxation engine; Hy3's file is js/magBzPoissonHy3.js).
 // Per-step forward-Euler rate; the slider caps at 0.24 (CFL requires
 // 4·α ≤ 1, and 0.25 is exactly marginal — see magfield_diffusion.js).
+// α is a pure SPEED knob: it sets the relaxation time constant only, never
+// the settled amplitude (the source is folded inside the α bracket, so the
+// settled state is ∇²Bz = S₀ with S₀ α-independent — see magDiffusionRelax).
 let MAG_DIFFUSION_ALPHA = 0.20;
+// Source gain of the 'diffusion' engine, mirroring Hy3's MAG_SRC_GAIN_HY3:
+// the Stokes curl source on the unit grid is ~20× smaller than the tapered
+// windowed sum, so scale it so the field is in the same ballpark at the same
+// K_B. Declared here (not as a const in the engine file) so tests and the
+// console can retune it without editing the engine.
+let MAG_SRC_GAIN_DIFF = 20;
+
+// Per-engine UI binding table — the ONE place that knows what each magnetic
+// engine exposes. Used by js/ui.js (magEngineOnChange: re-binds the shared
+// #magRange slider, toggles the per-engine checkboxes, shows the caveat) and by
+// updateStatus() below (the status-bar label). Before this table the 4-way
+// label mapping existed twice (state.js + ui.js, kept in sync by hand — 15.5
+// item 8) and the slider re-binding was a 4-branch if/else repeating itself.
+//
+// `note` is a caveat the user must be able to SEE, not just read in the docs:
+// 16.1 T3's finding was that hiding #magDipoles under 'diffusion' silently
+// dropped the magnet↔magnet force law. `emf` records whether the engine injects
+// back-EMF (mirrors magEngineInjectsEmf() in electric.js) — the two field-only
+// engines say so here instead of letting the energy identity look broken.
+const MAG_ENGINE_UI = {
+	tapered: {
+		tag: 'Diffusion-Ar (tapered)', unit: 'cells', min: 2, max: 16, step: 1,
+		value: () => MAG_RANGE, fmt: (v) => String(v),
+		emit: true, dipoles: false, emf: true, note: ''
+	},
+	diffusion: {
+		tag: 'Diffusion (visual relaxation)', unit: 'α', min: 0.02, max: 0.24, step: 0.01,
+		value: () => +MAG_DIFFUSION_ALPHA.toFixed(2), fmt: (v) => (+v).toFixed(2),
+		emit: false, dipoles: false, emf: false,
+		note: 'field-only (no back-EMF) · dipoles unsupported — magnet↔magnet interaction is off'
+	},
+	hy3: {
+		tag: 'Diffusion-Hy3 (screened)', unit: 'λ', min: 0.02, max: 1, step: 0.01,
+		value: () => +MAG_LAMBDA.toFixed(2), fmt: (v) => (+v).toFixed(2),
+		emit: false, dipoles: true, emf: false, note: 'field-only (no back-EMF)'
+	},
+	direct: {
+		tag: 'Direct (obsolete)', unit: 'cells', min: 2, max: 16, step: 1,
+		value: () => MAG_RANGE, fmt: (v) => String(v),
+		emit: false, dipoles: false, emf: true, note: ''
+	}
+};
+// The active engine's row, with a fallback so an unknown/legacy save value can't
+// throw inside the status bar.
+function magEngineUi() { return MAG_ENGINE_UI[magEngine] || MAG_ENGINE_UI.diffusion; }
 
 function bodyMoveAxis(b) { return b.moveAxis || b.axis; }
 function isCaseA(b) { return !!b.magnet && b.axis && bodyMoveAxis(b) !== b.axis; }
@@ -514,10 +569,13 @@ function updateStatus(x, y) {
 		}
 	}
   const engineName = activeEngine === 'field' ? 'Field' : 'Circuit (obsolete)';
-  const magName = magEngine === 'direct' ? 'Direct (obsolete)'
-                : magEngine === 'hy3'     ? 'Diffusion-Hy3 (screened)'
-                : magEngine === 'tapered' ? 'Diffusion-Ar (tapered)'
-                :                           'Diffusion (visual relaxation)';
+  // Engine label from the shared MAG_ENGINE_UI table, with the field-only
+  // caveat appended: 'hy3' and 'diffusion' inject no back-EMF, so the closed-
+  // loop energy identity does not close under them (see magEngineInjectsEmf in
+  // electric.js). Saying it in the always-visible status bar is what keeps that
+  // from looking like a bug.
+  const magUi = magEngineUi();
+  const magName = magUi.tag + (magUi.emf ? '' : ' · field-only');
   const viewName = colorView === 'net' ? 'Net' : colorView === 'electric' ? 'Electric' : colorView === 'voltage' ? 'Voltage' : colorView === 'heat' ? 'Heat' : colorView === 'pressure' ? 'Pressure' : colorView === 'bfield' ? 'B-field' : 'Light';
   statusBar.textContent = `Tool: ${tn}   |   Cell: ${ci}   |   Type: ${ti}${extra}   |   Net: ${selectedColor}   |   View: ${viewName}   |   Engine: ${engineName}   |   Mag: ${magName}   |   T: ${tStr}   |   P: ${pStr}`;
 }

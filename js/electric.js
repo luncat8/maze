@@ -342,14 +342,23 @@ let fieldV = null;                 // Float64Array(N): current potential (V)
 let fieldSystems = [];             // one relaxation system per battery-fed component
 let fieldLampByIdx = new Map();    // idx -> lamp (for the dV readout)
 let fieldPumpByIdx = new Map();    // idx -> pump (for load detection & readout)
-const FIELD_SWEEPS_PER_FRAME = 50; // electric field relaxation steps advanced each frame
+// ONE per-frame relaxation budget for the unified field tick, shared by both
+// halves of it: the electric-potential solve (fieldRelax) and the magnetic Bz
+// advance of every engine (the 4-way dispatch in fieldPublish). Both were 50
+// and both mean "how much relaxation work one frame buys", but they used to be
+// two differently-named constants (FIELD_SWEEPS_PER_FRAME here +
+// MAG_SWEEPS_PER_FRAME in state.js) — the naming drift 17-T5 removes. If an
+// engine ever needs its own budget (e.g. the deferred "diffusion speed"
+// slider), split the magnetic half back out at that point.
+const FIELD_SWEEPS_PER_FRAME = 50;
 let simRunning = false;            // unified sim (field + heat) loop is active
 let fieldDirty = false;            // force at least one more field frame
 let heatDirty = false;             // force at least one more heat frame
 let fieldEdges = [];               // {a,b,Re,dlx,dly,mx,my,E,I,key}
 let fieldEdgeMap = new Map();      // "a:b" -> edge
 let fieldBz = null;                // per-cell Bz overlay
-let magEnergyResidual = 0;         // Σ E·I + Σ F·v (should be ~0)
+let magEnergyResidual = NaN;        // Σ E·I + Σ F·v — meaningful only when magEnergyResidualValid
+let magEnergyResidualValid = false; // false ⇒ the active magnetic engine injects no back-EMF (17-T2)
 
 function magKernelG(dlx, dly, rx, ry, sig2) {
 	const den = rx * rx + ry * ry + sig2;
@@ -389,11 +398,16 @@ function edgeIsSelf(edge, body) {
 //
 // 'diffusion' (default) — Explicit forward-Euler cell-to-cell diffusion.
 //   Bz is transient solver state advanced by
-//      Bz ← Bz + α·(sum of 4 neighbors − 4·Bz) + S
-//   where S is the discrete curl of the edge currents. MAG_DIFFUSION_ALPHA
-//   is user-tunable (slider 0.02..0.24; CFL stability requires 4·α ≤ 1 and
-//   0.25 is exactly marginal — see js/magfield_diffusion.js).
-//   No back-EMF injection.
+//      Bz ← Bz + α·(sum of 4 neighbors − 4·Bz − S)
+//   i.e. ∂Bz/∂t = α·(∇²Bz − S), whose settled state is the Poisson problem
+//   ∇²Bz = S with S = K_B·MAG_SRC_GAIN_DIFF·(discrete curl of the edge
+//   currents) — the same equation and source sign convention as 'hy3' at λ=0,
+//   which is what keeps lastFcoil's sign stable across an engine switch.
+//   MAG_DIFFUSION_ALPHA is user-tunable (slider 0.02..0.24; CFL stability
+//   requires 4·α ≤ 1 and 0.25 is exactly marginal — see
+//   js/magfield_diffusion.js) and is a pure SPEED knob: the source sits inside
+//   the α bracket, so α sets the relaxation time constant only and the settled
+//   amplitude is α-independent. No dipole support, no back-EMF injection.
 //
 // 'tapered' — Analytic-tapered diffusion. ψ = Σ_e K_B·I_e·w(|r−m_e|)·g_σ is
 //   the analytic Biot–Savart field tapered by a compact C¹ window w (see
@@ -422,7 +436,9 @@ let magPsi = null;      // Float64Array(N): analytic-Bz scratch for the source
 let magRed = null;      // checkerboard cell lists (built once)
 let magBlack = null;
 let magSrcCells = 0;    // nonzero source cells in the last build (0 ⇒ B must be 0)
-let magLastDv = 0;      // max |ΔBz| of the last magRelax call
+let magLastDBz = 0;     // max |ΔBz| of the last magRelax call (was `magLastDv` — it
+                        // tracks Bz, not a voltage; the genuine per-system voltage
+                        // delta is `s.lastDv` in fieldRelax) — 17-T5
 let magEdgeCells = null; // per-cell list of incident edges (rebuilt per fieldSimulate)
 let magCoupleStamp = 0;  // dedup stamp for magBuildCoupling
 
@@ -469,12 +485,29 @@ function magDipGrad(dx, dy, m) {
 	return { gx: c * dx, gy: c * dy };
 }
 
-// The conductor edge a body physically spans (Case-A armature bridge). A body
-// must never be pushed by its own armature current, so all three persistent
-// engines drop these edges from the source. 'tapered' uses `magSelfEdge` to
-// pre-compute the per-magnet self-edge set before assembly; 'hy3' and
-// 'diffusion' use `edgeIsSelf(e, mag)` inline inside the source loop — same
-// per-magnet exclusion pattern, just computed at different points.
+// The conductor edge a body physically spans (Case-A armature bridge).
+//
+// Invariant: a body is never pushed by its OWN armature current — the Case-A
+// motor force comes from the rails, not from the bridge (spelled out at the
+// magSolveDirect call site, which is the oldest statement of it). Only the
+// bridge edge itself is excluded; edges merely ADJACENT to the body cells are
+// kept on purpose, because a magnet legitimately feels the field of nearby
+// current, including its own driving coil.
+//
+// All four engines honour the invariant, but at different points:
+//   'tapered'    pre-computes the per-magnet self-edge set with magSelfEdge
+//                before assembly (magBuildCoupling / magBuildCoilSource), so
+//                the analytic kernel never sees the bridge;
+//   'hy3'        tests edgeIsSelf(e, mag) for every magnet inline inside
+//                magBzPoissonHy3BuildSource's source loop;
+//   'diffusion'  same inline edgeIsSelf test inside magDiffusionBuildSource;
+//   'direct'     inline edgeIsSelf test inside magSolveDirect.
+//
+// Do not confuse this with Hy3's per-magnet self-FIELD buffers
+// (magSrcSelfHy3 / magBzSelfHy3): those cancel a magnet's own DIPOLE field
+// when MAG_DIPOLES is on, which is a different mechanism (self-force from the
+// injected dipole source, not from the armature current) that merely happens
+// to be per-magnet as well.
 function magSelfEdge(mag) {
 	const cells = bodyCells(mag);
 	for (let i = 0; i < cells.length; i++) {
@@ -489,6 +522,75 @@ function magSelfEdge(mag) {
 		}
 	}
 	return null;
+}
+
+// ---- Shared magnet telemetry for the two field-only engines --------------
+// 'hy3' and 'diffusion' both publish the same per-magnet telemetry: sample Bz
+// and its 1-cell gradient off the relaxed grid, form the dipole force
+// F = m·∂Bz/∂hat, then derive the legacy readouts (lastBz, lastFcoil,
+// lastPower, lastCurrent, lastEMF, lastHeat). The two bodies were duplicated
+// verbatim (~40 lines each — 16.1 review finding F), so both now delegate
+// here. Lives in this file because it is the module both engines already
+// depend on (magnetList, edgeIsSelf, isCaseA, bodyHat, bodyCenter, fieldEdges).
+//
+//   mags          magnetList()
+//   bzAt          (cx, cy) => Bz of the engine's relaxed grid, 0 off-grid
+//   opts.selfGrad optional (mag, mcx, mcy) => { dx, dy }, subtracted from the
+//                 sampled gradient before the force is formed. Hy3 passes its
+//                 own-dipole self-field solve here when MAG_DIPOLES is on, so
+//                 a magnet exerts no net force on itself; 'diffusion' passes
+//                 nothing (it injects no dipole source at all — see the
+//                 unsupported-dipoles note in js/magfield_diffusion.js).
+//
+// Cost is O(magnets × edges) for the armature/bridge scan below — unchanged
+// from the two copies this replaces.
+//
+// NOTE: neither engine injects back-EMF into `e.E`, so `Eb`/`elecP` here are
+// TELEMETRY ONLY — they report what the motional EMF would be, and the
+// closed-loop energy identity does not close under them (see magEnergyResidual
+// and magEngineInjectsEmf). 'tapered' and 'direct' write the real EMF from the
+// analytic kernel instead (magApplyEmfDiffusion / magApplyEmfDirect), which is
+// why they do not use this helper.
+function magPublishTelemetry(mags, bzAt, opts) {
+	const selfGrad = (opts && opts.selfGrad) || null;
+	for (let mi = 0; mi < mags.length; mi++) {
+		const mag = mags[mi];
+		const m = mag.magStrength != null ? mag.magStrength : 1;
+		const hat = bodyHat(mag);
+		const c = bodyCenter(mag);
+		const mcx = Math.round(c.x), mcy = Math.round(c.y);
+		let dBzdx = (bzAt(mcx + 1, mcy) - bzAt(mcx - 1, mcy)) * 0.5;
+		let dBzdy = (bzAt(mcx, mcy + 1) - bzAt(mcx, mcy - 1)) * 0.5;
+		if (selfGrad) {
+			const sg = selfGrad(mag, mcx, mcy);
+			dBzdx -= sg.dx;
+			dBzdy -= sg.dy;
+		}
+		const Bz = bzAt(mcx, mcy);
+		// Dipole force: F = ∇(m·B) = m·(∂Bz/∂hat).
+		const F = m * (dBzdx * hat.ax + dBzdy * hat.ay);
+
+		// Per-magnet armature / peak edge current (legacy-compatible readouts).
+		let maxI = 0, bridgeI = 0;
+		for (let ei = 0; ei < fieldEdges.length; ei++) {
+			const e = fieldEdges[ei];
+			if (edgeIsSelf(e, mag)) { bridgeI = e.I; continue; }
+			if (Math.abs(e.I) > Math.abs(maxI)) maxI = e.I;
+		}
+		// Motional EMF of the magnet's own motion through the local field
+		// gradient (same physics as the legacy Eb = −m·K_B·∂G/∂hat·v).
+		const dBzdh = dBzdx * hat.ax + dBzdy * hat.ay;
+		const Eb = -m * dBzdh * (mag.vel || 0);
+		const lastCurrent = isCaseA(mag) ? bridgeI : maxI;
+		const elecP = Eb * lastCurrent;
+		mag.lastBz = Bz;
+		mag.lastFcoil = F;
+		mag.lastPower = elecP;
+		mag.lastCurrent = lastCurrent;
+		mag.lastEMF = lastCurrent ? elecP / lastCurrent : 0;
+		const eta = mag.efficiency != null ? mag.efficiency : 0.85;
+		mag.lastHeat = Math.abs(elecP) * Math.max(0, 1 - eta);
+	}
 }
 
 // Per-cell index of incident edges, so a magnet only ever looks at the edges
@@ -563,7 +665,27 @@ function magBuildCoupling(mags) {
 	}
 }
 
-// Induced (motional) EMF — LEGACY shape, byte-identical to the pre-diffusion
+// Does the ACTIVE magnetic engine inject motional back-EMF into `e.E`? Only
+// then does the lossless-coupling identity Σ E·I = −Σ F·v hold, and only then
+// is `magEnergyResidual` a meaningful diagnostic (17-T2). 'tapered' and
+// 'direct' inject (magApplyEmfDiffusion / magApplyEmfDirect, right below);
+// 'hy3' and 'diffusion' are field-only in this phase, so under them Σ E·I ≡ 0
+// and the "residual" would just be Σ F·v — a number that looks like a
+// convergence diagnostic but isn't one. Phase 2 (a shared magInjectEmfAnalytic
+// routed through both field-only engines) flips those two to true.
+function magEngineInjectsEmf() {
+	return magEngine === 'tapered' || magEngine === 'direct';
+}
+
+// Display form of the energy residual — never print the raw number, or the
+// gated (NaN) case reads as a bug instead of as "not applicable".
+function magEnergyResidualText() {
+	return magEnergyResidualValid
+		? magEnergyResidual.toExponential(2)
+		: `n/a (field-only engine '${magEngine}' injects no back-EMF)`;
+}
+
+// Magnet-induced (motional) EMF — LEGACY shape, byte-identical to the pre-diffusion
 // inline loop: hard MAG_RMAX cutoff, no window, no power projection.
 function magApplyEmfDirect(mags) {
 	const sig2 = SIGMA_B * SIGMA_B;
@@ -718,7 +840,7 @@ function magRelax(buf, sweeps) {
 			}
 		}
 	}
-	magLastDv = maxc;
+	magLastDBz = maxc;
 	return maxc;
 }
 
@@ -893,7 +1015,7 @@ function magReset() {
 	if (fieldBz) fieldBz.fill(0);
 	if (typeof magBzPoissonHy3Reset === 'function') magBzPoissonHy3Reset();
 	if (typeof magDiffusionReset === 'function') magDiffusionReset();
-	magSrcCells = 0; magLastDv = 0;
+	magSrcCells = 0; magLastDBz = 0;
 }
 
 function fieldSimulate() {
@@ -1273,32 +1395,46 @@ function fieldPublish() {
 		// field-advance is the only step Hy3 needs from this site; its
 		// publish() updates magnet telemetry. Internal MAG_SWEEPS = 40
 		// (declared in the file) is used only for self-field convergence;
-		// per-frame relaxation uses the shared MAG_SWEEPS_PER_FRAME (50).
+		// per-frame relaxation uses the shared FIELD_SWEEPS_PER_FRAME (50).
 		magBzPoissonHy3BuildSource();
-		magBzPoissonHy3Relax(MAG_SWEEPS_PER_FRAME);
+		magBzPoissonHy3Relax(FIELD_SWEEPS_PER_FRAME);
 		magBzPoissonHy3Publish(mags);
 	} else if (magEngine === 'tapered' && (mags.length || colorView === 'bfield')) {
 		// The 'tapered' analytic-tapered diffusion engine. The diffused field
 		// only needs advancing when something can read it:
 		// a magnet (force / EMF / telemetry) or the B-field view.
-		magSolveDiffusion(mags, MAG_SWEEPS_PER_FRAME);
+		magSolveDiffusion(mags, FIELD_SWEEPS_PER_FRAME);
 	} else if (magEngine === 'diffusion' && (mags.length || colorView === 'bfield')) {
 		magDiffusionBuildSource();
-		magDiffusionRelax(MAG_SWEEPS_PER_FRAME);
+		magDiffusionRelax(FIELD_SWEEPS_PER_FRAME);
 		magDiffusionPublish(mags);
 	}
 	// Energy residual: Σ E_e·I_e + Σ F_m·v_m. This equals the algebraic
-// lossless-coupling identity Σ E·I = −F·v (comment above
-// magApplyEmfDiffusion) ONLY for engines that inject back-EMF. Currently
-// that's 'tapered' alone; 'direct', 'hy3', and 'diffusion' all read the
-// telemetry `lastFcoil` and `lastCurrent` but never write back to `e.E`,
-// so the residual is non-zero by design under those engines. Kept as a
-// single-line diagnostic — see 16-plan: open question is whether to gate
-// it on the injecting engine.
-	let residual = 0;
-	for (let ei = 0; ei < fieldEdges.length; ei++) residual += fieldEdges[ei].E * fieldEdges[ei].I;
-	for (let mi = 0; mi < mags.length; mi++) residual += (mags[mi].lastFcoil || 0) * (mags[mi].vel || 0);
-	magEnergyResidual = residual;
+	// lossless-coupling identity Σ E·I = −F·v (comment above
+	// magApplyEmfDiffusion) ONLY for engines that inject back-EMF —
+	// 'tapered' and 'direct'. 'hy3' and 'diffusion' read the telemetry
+	// `lastFcoil` / `lastCurrent` but never write `e.E`, so under them
+	// Σ E·I ≡ 0 and the sum degenerates to Σ F·v: a stale-looking number
+	// that reads like a convergence diagnostic but isn't one.
+	//
+	// 17-T2 gates it (option 1 of that item — the honest, small-surface
+	// choice): when the gate is closed the value is NaN and
+	// `magEnergyResidualValid` is false, so nothing can mistake it for a
+	// closed identity, and an assertion like |residual| < 1e-9 fails loudly
+	// instead of passing on a meaningless 0. Show it with
+	// magEnergyResidualText(), which prints "n/a (field-only engine …)".
+	// Injecting back-EMF under the field-only engines (option 2) is a
+	// separate, larger plan — it changes the closed-loop dynamics.
+	const residualCloses = activeEngine === 'field' && magEngineInjectsEmf();
+	magEnergyResidualValid = residualCloses;
+	if (residualCloses) {
+		let residual = 0;
+		for (let ei = 0; ei < fieldEdges.length; ei++) residual += fieldEdges[ei].E * fieldEdges[ei].I;
+		for (let mi = 0; mi < mags.length; mi++) residual += (mags[mi].lastFcoil || 0) * (mags[mi].vel || 0);
+		magEnergyResidual = residual;
+	} else {
+		magEnergyResidual = NaN;
+	}
 
 	// The electric field is live, so heat tracks it every frame. Build the
 	// shared per-cell R grid + Joule heat sources now; the unified tick's

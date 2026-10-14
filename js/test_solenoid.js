@@ -381,6 +381,34 @@ assert(Math.sign(hy3c.F) === Math.sign(arb.F),
 assert(Number.isFinite(hy3c.Bz),
 	`Hy3 populates magnet telemetry with a finite lastBz (${hy3c.Bz})`);
 
+// 5d — the DEFAULT engine ('diffusion', forward-Euler cell-to-cell) on the same
+// L-loop scene: a finite, non-zero force with the SAME SIGN as 'tapered' (5a)
+// and 'hy3' (5c). No byte-equality — diffusion is hy3 at λ=0 but with an
+// explicit transient update and a different gain convention, so the field shape
+// differs; matching 5c's posture on that.
+//
+// The sign is the part worth pinning: 'diffusion' builds its source with the
+// same signed-incidence curl as Hy3 and (since 16.1 T1) settles onto the same
+// Poisson equation ∇²Bz = S, so an engine switch must not flip the polarity of
+// lastFcoil. Measured on this scene: tapered +3.198e-1, hy3 +1.680e+0,
+// diffusion +1.725e+0.
+runCode(`magEngine = 'diffusion'; MAG_DIFFUSION_ALPHA = 0.20; magReset(); fieldSimulate();`);
+settle(40);
+runCode(`
+	var mag = pistons[0];
+	globalThis.__diffd = { F: mag.lastFcoil, Bz: mag.lastBz, engine: magEngine };
+	magEngine = 'tapered'; magReset(); fieldSimulate();
+`);
+const diffd = sandbox.__diffd;
+console.log(`   diffusion L-loop: F=${diffd.F.toExponential(2)}, lastBz=${diffd.Bz.toFixed(3)}`);
+assert(diffd.engine === 'diffusion', `Test 5d ran on the diffusion engine (got ${diffd.engine})`);
+assert(Number.isFinite(diffd.F) && diffd.F !== 0,
+	`Diffusion produces a finite non-zero force on the L-loop magnet (F=${diffd.F})`);
+assert(Math.sign(diffd.F) === Math.sign(arb.F),
+	`Diffusion force has the same sign as the tapered engine on the L-loop (Diffusion=${diffd.F.toExponential(2)}, tapered=${arb.F.toExponential(2)})`);
+assert(Number.isFinite(diffd.Bz),
+	`Diffusion populates magnet telemetry with a finite lastBz (${diffd.Bz})`);
+
 // ---- 6. Case A armature bridge ----
 console.log('\n== Test 6: Case A armature bridge ==');
 clearBoard();
